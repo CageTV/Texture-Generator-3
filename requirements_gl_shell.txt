@@ -1,0 +1,16 @@
+# TG3 GL shell dependencies.
+# The original texture_generator.py's own requirements (pillow numpy
+# moderngl glcontext opencv-python-headless pyinstaller) are unchanged and
+# still needed alongside these - this file adds only what the new shell
+# itself needs on top of that.
+
+# Pinned: imgui-bundle's Python API (texture-id binding for imgui.image(),
+# enum access style, RunnerParams field names) has shifted between minor
+# versions before. If you bump this, main_gl.py's imgui.image(...) calls
+# and app/theme.py's imgui.Col_.* references are the first things to check.
+imgui-bundle==1.6.2
+
+moderngl>=5.8
+glcontext
+pillow
+numpy

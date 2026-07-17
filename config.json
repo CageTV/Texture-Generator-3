@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "emissive": false,
+    "parallax": true,
+    "subsurface": false,
+    "subsurface_foliage": false,
+    "smooth_angle": 75,
+    "specular_level": 0.04,
+    "subsurface_color": [1, 1, 1],
+    "roughness_scale": 1,
+    "subsurface_opacity": 1
+  },
+  "keywords": {
+    "snow": { "displacement_scale": 0.4 },
+    "glass": { "displacement_scale": 0.03 }
+  },
+  "file_overrides": {
+    "exampletexture01": { "displacement_scale": 0.4 },
+    "architecture\\farmhouse\\exampletexture01": { "displacement_scale": 0.25 }
+  }
+}

@@ -1,0 +1,56 @@
+#version 430
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r32f) uniform readonly image2D src;
+layout(rgba32f) uniform writeonly image2D dst;
+
+uniform float strength;   // meaning depends on zMode (see below)
+uniform float gradMul;    // normalizes the Sobel kernel sum vs. central-difference
+uniform int   useX;       // 0/1 - zero the X gradient (Red channel) when off
+uniform int   useY;       // 0/1 - zero the Y gradient (Green channel) when off
+uniform float flipX;      // +1.0 or -1.0
+uniform float flipY;      // +1.0 or -1.0
+uniform int   fullZ;      // 0/1 - enhanced-contrast Z mapping
+uniform int   zMode;      // 0 = height-field mode (dz = 1/strength, original TG3 behavior)
+                           // 1 = direct-image mode (dz = 1, dx/dy *= strength) - matches CPU generate_normal_map
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(src);
+
+    if (p.x < 1 || p.y < 1 || p.x >= sz.x-1 || p.y >= sz.y-1) {
+        imageStore(dst, p, vec4(0.5, 0.5, 1.0, 1.0));
+        return;
+    }
+
+    float h00 = imageLoad(src, p + ivec2(-1,-1)).r;
+    float h10 = imageLoad(src, p + ivec2( 0,-1)).r;
+    float h20 = imageLoad(src, p + ivec2( 1,-1)).r;
+    float h01 = imageLoad(src, p + ivec2(-1, 0)).r;
+    float h21 = imageLoad(src, p + ivec2( 1, 0)).r;
+    float h02 = imageLoad(src, p + ivec2(-1, 1)).r;
+    float h12 = imageLoad(src, p + ivec2( 0, 1)).r;
+    float h22 = imageLoad(src, p + ivec2( 1, 1)).r;
+
+    float dx = (h20 + 2.0*h21 + h22 - h00 - 2.0*h01 - h02) * gradMul;
+    float dy = (h02 + 2.0*h12 + h22 - h00 - 2.0*h10 - h20) * gradMul;
+    float dz;
+
+    if (zMode == 1) {
+        dx *= strength;
+        dy *= strength;
+        dz = 1.0;
+    } else {
+        dz = 1.0 / max(strength, 0.001);
+    }
+
+    if (useX == 0) dx = 0.0;
+    if (useY == 0) dy = 0.0;
+    dx *= flipX;
+    dy *= flipY;
+
+    vec3 n = normalize(vec3(dx, dy, dz));
+
+    float outZ = (fullZ == 1) ? n.z : (n.z * 0.5 + 0.5);
+    imageStore(dst, p, vec4(n.x * 0.5 + 0.5, n.y * 0.5 + 0.5, outZ, 1.0));
+}

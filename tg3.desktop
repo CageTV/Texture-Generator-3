@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TG3 Texture Generator
+Comment=PBR/texture generation and Skyrim modding toolkit
+Exec=/path/to/TG3
+Icon=/path/to/tg3-icon.png
+Terminal=false
+Categories=Graphics;
