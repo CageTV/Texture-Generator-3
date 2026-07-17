@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) [year] [fullname]
+Copyright (c) 2026 Julio005 - Texture Generator TG3
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+THIRD-PARTY NOTICES:
+- texconv.exe is part of Microsoft DirectXTex (MIT License) - https://github.com/microsoft/DirectXTex
+- BSArch.exe by the Skyrim modding community - see BSArch license
+- Pillow, numpy, opencv-python, moderngl, etc. retain their own licenses
