@@ -349,7 +349,8 @@ def edge_from_diffuse(img: np.ndarray,
     edges = cv2.Canny(gray, threshold_low, threshold_high)
 
     if dilate > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1))
+        d = int(round(dilate))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d * 2 + 1, d * 2 + 1))
         edges = cv2.dilate(edges, k, iterations=1)
 
     if soften > 0:

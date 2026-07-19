@@ -5,33 +5,41 @@ No ImageMagick required — format conversions via PIL + texconv.
 texconv.exe is bundled inside this executable.
 """
 
-import os, sys, subprocess, shutil, threading, tempfile
+import os, sys, subprocess, shutil, threading, tempfile, json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from PIL import Image, ImageTk
 import numpy as np
-import cv2
-
-import platform_tools as _pt
+from ui_widgets import RoundedButton
+try:
+    from version import VERSION
+except Exception:
+    VERSION = "1.1.6"
 
 try:
     import pbr_engine as _pe
     _PBR_OK = True
-except ImportError:
+    _PBR_ERR = None
+except Exception as e:
     _PBR_OK = False
+    _PBR_ERR = f'{type(e).__name__}: {e}'
 
 try:
     import material_engine as _me
     _MAT_OK = True
-except ImportError:
+    _MAT_ERR = None
+except Exception as e:
     _MAT_OK = False
+    _MAT_ERR = f'{type(e).__name__}: {e}'
 
 try:
     import material_preview as _mp
     _MP_OK = True
-except ImportError:
+    _MP_ERR = None
+except Exception as e:
     _MP_OK = False
+    _MP_ERR = f'{type(e).__name__}: {e}'
 
 try:
     import gpu_engine as _ge
@@ -42,18 +50,145 @@ except Exception:
 _preview_win = None  # singleton
 
 
+class _Tooltip:
+    """Minimal hover tooltip. The quick-launch icon buttons are small by
+    design (room for more apps later without crowding), so they need a
+    label-on-hover to stay identifiable rather than a text label baked in."""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind('<Enter>', self._show, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+
+    def _show(self, _e=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f'+{x}+{y}')
+        tk.Label(self.tip, text=self.text, bg='#2b2b2b', fg=C['text'],
+                 font=('Segoe UI', 8), padx=6, pady=3, relief='solid', bd=1
+                 ).pack()
+
+    def _hide(self, _e=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class _CustomToolDialog(tk.Toplevel):
+    """Modal for setting up a custom quick-launch slot: a Name field and a
+    Path field (with its own Browse button) both visible in the same
+    window at once - not two separate sequential popups, since a name
+    prompt closing on its own made it look like nothing else was going to
+    happen, and the file-browse dialog that followed was easy to miss.
+
+    .result is (name_or_None, path) on OK, or None if cancelled.
+    """
+    def __init__(self, parent, initial_name='', initial_path=''):
+        super().__init__(parent)
+        self.result = None
+        self.title('Custom Shortcut')
+        self.configure(bg=C['bg'])
+        self.resizable(False, False)
+        self.transient(parent)
+
+        tk.Label(self, text='Name (shown on hover):', bg=C['bg'], fg=C['text'],
+                 font=('Segoe UI', 9)).pack(anchor='w', padx=10, pady=(12, 0))
+        self.name_var = tk.StringVar(value=initial_name)
+        tk.Entry(self, textvariable=self.name_var, bg=C['input'], fg=C['text'],
+                 insertbackground=C['text'], relief='flat', font=('Segoe UI', 9), bd=2,
+                 width=44).pack(fill='x', padx=10, pady=(3, 0))
+
+        tk.Label(self, text='Path to .exe:', bg=C['bg'], fg=C['text'],
+                 font=('Segoe UI', 9)).pack(anchor='w', padx=10, pady=(10, 0))
+        row = tk.Frame(self, bg=C['bg'])
+        row.pack(fill='x', padx=10, pady=(3, 0))
+        self.path_var = tk.StringVar(value=initial_path)
+        tk.Entry(row, textvariable=self.path_var, bg=C['input'], fg=C['text'],
+                 insertbackground=C['text'], relief='flat', font=('Segoe UI', 9), bd=2
+                 ).pack(side='left', fill='x', expand=True)
+        RoundedButton(row, text='Browse…', command=self._browse,
+                      bg=C['accent'], fg='white', font=('Segoe UI', 9, 'bold'),
+                      pad=(10, 4)).pack(side='left', padx=(6, 0))
+
+        btns = tk.Frame(self, bg=C['bg'])
+        btns.pack(fill='x', padx=10, pady=12)
+        RoundedButton(btns, text='OK', command=self._ok,
+                      bg=C['success'], fg='white', font=('Segoe UI', 9, 'bold'),
+                      pad=(16, 5)).pack(side='right')
+        RoundedButton(btns, text='Cancel', command=self.destroy,
+                      bg=C['panel2'], fg=C['text'], font=('Segoe UI', 9, 'bold'),
+                      pad=(16, 5)).pack(side='right', padx=(0, 6))
+
+        self.update_idletasks()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _browse(self):
+        p = filedialog.askopenfilename(
+            title='Locate the .exe', parent=self,
+            filetypes=[('Executable', '*.exe'), ('All files', '*.*')])
+        if p:
+            self.path_var.set(p)
+
+    def _ok(self):
+        name = self.name_var.get().strip()
+        path = self.path_var.get().strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showerror('Custom Shortcut', 'Please Browse to a valid .exe first.', parent=self)
+            return
+        self.result = (name or None, path)
+        self.destroy()
+
+
 # ─── Paths ────────────────────────────────────────────────────────────────────
 def resource_path(rel):
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, rel)
 
 def texconv_exe():
-    """Windows only -- kept for any code path that still wants the raw
-    exe path directly. Prefer _pt.texconv_available()/dds_decode/dds_encode."""
+    """texconv is bundled inside the exe (_MEIPASS) or next to the script."""
     return resource_path('texconv.exe')
 
 def bsarch_exe():
+    """BSArch.exe — bundled inside the exe or next to the script."""
     return resource_path('BSArch.exe')
+
+def powershell_exe():
+    """Bundled portable powershell.exe for running the PBR JSON Builder's
+    PowerShell scripts (Step1.ps1 / Step2.ps1) without depending on the
+    system's own PowerShell install/execution policy."""
+    return resource_path('powershell.exe')
+
+def app_config_dir():
+    """Where user-editable config (external_tools.json, etc.) lives - next
+    to the exe when frozen, next to this script otherwise. Deliberately
+    NOT resource_path()'s _MEIPASS: that folder is read-only and gets
+    wiped between runs, so anything we need to persist has to live
+    somewhere else."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+EXTERNAL_TOOLS_FILE = os.path.join(app_config_dir(), 'external_tools.json')
+
+def load_external_tool_paths():
+    try:
+        with open(EXTERNAL_TOOLS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_external_tool_paths(paths):
+    try:
+        with open(EXTERNAL_TOOLS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(paths, f, indent=2)
+    except Exception:
+        pass
 
 # BSA archive format options for packing
 _BSA_PACK_FORMATS = [
@@ -68,14 +203,31 @@ _BSA_PACK_FORMATS = [
 ]
 
 
-# ─── DDS smart-format table (from DDSTool) ───────────────────────────────────
+# ─── DDS smart-format table (from DDS Tool; also seeds Resize Tool's rules) ──
+# Defaults below follow the standard Skyrim Community Shaders PBR guidance
+# (diffuse/normal/specular/emissive/opacity as RGBA-capable BC7 or BC3;
+# roughness/metalness/height/AO as single-channel BC4) - all still editable
+# per-rule via the dropdown in either tab, this is just the starting point.
+#
+# Note on '_s': this app's own established convention (see generate.py /
+# BUILD_README) already uses bare '_s' for SUBSURFACE, not "specular" in the
+# generic PBR sense - so Specular/Gloss here uses '_spec'/'_specular'/'_gloss'
+# instead, to avoid silently reinterpreting an existing suffix's meaning.
 _DDS_RULES = [
-    (('_n',),                       'BC7_UNORM',      'Normal map'),
-    (('_p', '_height'),             'BC4_UNORM',      'Height / Parallax'),
-    (('_rmaos', '_ao', '_orm'),     'BC7_UNORM',      'RMAOS / AO / ORM'),
-    (('_s', '_specular'),           'BC7_UNORM',      'Specular'),
-    (('_g', '_glow', '_emissive'),  'BC7_UNORM_SRGB', 'Emissive'),
-    (('_m', '_mask'),               'BC4_UNORM',      'Mask'),
+    (('_n',),                                         'BC7_UNORM',      'Normal'),
+    (('_spec', '_specular', '_gloss'),                'BC7_UNORM',      'Specular / Gloss'),
+    (('_r', '_rough', '_roughness'),                  'BC4_UNORM',      'Roughness'),
+    (('_m', '_mask', '_metal', '_metalness'),         'BC4_UNORM',      'Metalness'),
+    (('_env', '_envmask'),                            'BC7_UNORM',      'Environment / Glossiness Mask'),
+    (('_g', '_glow', '_emissive'),                    'BC7_UNORM_SRGB', 'Emissive / Glow'),
+    (('_opacity', '_alpha', '_trans'),                'BC3_UNORM',      'Opacity / Transparency'),
+    (('_ao', '_occlusion'),                           'BC4_UNORM',      'Ambient Occlusion'),
+    (('_p', '_height', '_displacement', '_parallax'), 'BC4_UNORM',      'Height / Displacement / Parallax'),
+    (('_dtl', '_detail'),                             'BC7_UNORM',      'Detail Map'),
+    (('_s', '_subsurface'),                           'BC7_UNORM',      'Subsurface'),
+    (('_cnr',),                                       'BC7_UNORM',      'Coat / Multilayer'),
+    (('_f',),                                         'BC7_UNORM',      'Fuzz / Sheen'),
+    (('_rmaos', '_orm'),                              'BC7_UNORM',      'RMAOS (packed R=AO G=Rough B=Metal)'),
 ]
 _DDS_DEFAULT = ('BC7_UNORM_SRGB', 'Albedo / Diffuse')
 
@@ -97,14 +249,80 @@ def smart_dds_format(filename):
     return _DDS_DEFAULT
 
 
+# ─── Resize Tool: per-map-type classification (same suffix convention the
+# PBR JSON Builder / generate.py already use, so a texture set classifies
+# the same way everywhere in the app). Same map types as _DDS_RULES above,
+# diffuse-first / rmaos-last for display order in the PER-MAP SIZE list. ──
+_RESIZE_MAP_TYPES = [
+    ('diffuse',    'Diffuse / Albedo',            ('_d',)),   # explicit suffix; no-suffix also falls here
+    ('normal',     'Normal',                      ('_n',)),
+    ('specular',   'Specular / Gloss',            ('_spec', '_specular', '_gloss')),
+    ('roughness',  'Roughness',                   ('_r', '_rough', '_roughness')),
+    ('metalness',  'Metalness',                   ('_m', '_mask', '_metal', '_metalness')),
+    ('env',        'Environment / Gloss Mask',    ('_env', '_envmask')),
+    ('glow',       'Emissive / Glow',             ('_g', '_glow', '_emissive')),
+    ('opacity',    'Opacity / Transparency',      ('_opacity', '_alpha', '_trans')),
+    ('ao',         'AO',                          ('_ao', '_occlusion')),
+    ('height',     'Height / Parallax',           ('_p', '_height', '_displacement', '_parallax')),
+    ('detail',     'Detail Map',                  ('_dtl', '_detail')),
+    ('subsurface', 'Subsurface',                  ('_s', '_subsurface')),
+    ('coat',       'Coat / Multilayer',           ('_cnr',)),
+    ('fuzz',       'Fuzz / Sheen',                ('_f',)),
+    ('rmaos',      'RMAOS',                       ('_rmaos', '_orm')),
+]
+_RESIZE_SIZE_CHOICES = ['Original / No Resize', '4096', '2048', '1024', '512', '256']
+
+_RESIZE_SUFFIX_FLAT = sorted(
+    ((suf, key) for key, _label, sufs in _RESIZE_MAP_TYPES for suf in sufs),
+    key=lambda pair: -len(pair[0])
+)
+
+def resize_classify(filename):
+    """Which map-type bucket a filename falls into, by suffix - longest
+    suffix wins first so overlapping suffixes never misclassify. No
+    recognized suffix -> 'diffuse' (the base/source texture, matching
+    generate.py's own convention for an un-suffixed file)."""
+    stem = Path(filename).stem.lower()
+    for suf, key in _RESIZE_SUFFIX_FLAT:
+        if stem.endswith(suf):
+            return key
+    return 'diffuse'
+
+
 # ─── texconv helpers ─────────────────────────────────────────────────────────
 def _tc_extract(src, out_dir):
-    """DDS/any → PNG in out_dir. Returns PNG path or None."""
-    return _pt.dds_decode(src, out_dir)
+    """texconv DDS/any → PNG in out_dir. Returns PNG path or None."""
+    tc = texconv_exe()
+    if not os.path.isfile(tc):
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run([tc, '-nologo', '-y', '-ft', 'png', '-o', str(out_dir), str(src)],
+                   capture_output=True)
+    out = out_dir / (Path(src).stem + '.png')
+    return str(out) if out.exists() else None
 
-def _tc_compress(src, dst, fmt):
-    """src → DDS at dst with given format."""
-    return _pt.dds_encode(src, dst, fmt)
+def _tc_compress(src, dst, fmt, width=None, height=None):
+    """texconv src → DDS at dst with given format. width/height are
+    optional - when given, texconv resizes during the same pass (its own
+    -w/-h flags) instead of this needing a separate resize step; existing
+    callers that don't pass them get the exact same behavior as before."""
+    tc = texconv_exe()
+    if not os.path.isfile(tc):
+        return False
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [tc, '-nologo', '-y', '-m', '0', '-bc', 'd', '-f', fmt]
+    if width:
+        cmd += ['-w', str(int(width))]
+    if height:
+        cmd += ['-h', str(int(height))]
+    cmd += ['-o', str(dst.parent), str(src)]
+    subprocess.run(cmd, capture_output=True)
+    expected = dst.parent / (Path(src).stem + '.dds')
+    if expected.exists() and expected != dst:
+        shutil.move(str(expected), str(dst))
+    return dst.exists()
 
 
 # ─── Normal map generator ────────────────────────────────────────────────────
@@ -162,19 +380,56 @@ class TextureGeneratorApp:
 
     W, H = 1100, 780
 
+    # Quick-launch external apps shown as small icon buttons next to the
+    # Input/Output Folder bar. The first three are known apps with default-
+    # install guesses; the four 'custom' slots start blank and prompt for
+    # both an .exe path AND a short display name the first time they're
+    # clicked, so anyone can wire up their own shortcut (Blender, GIMP,
+    # whatever) without touching code. Add a fifth fixed app the same way
+    # the first three are done, or just raise the range(1, 5) below for
+    # more custom slots - nothing else needs to change either way.
+    EXTERNAL_TOOLS = [
+        {
+            'key': 'upscayl', 'label': 'Upscayl', 'icon': '\u2b06', 'custom': False,
+            'guesses': [
+                r'C:\Program Files\Upscayl\Upscayl.exe',
+                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Upscayl\Upscayl.exe'),
+            ],
+        },
+        {
+            'key': 'pinta', 'label': 'Pinta', 'icon': '\u270e', 'custom': False,
+            'guesses': [
+                r'C:\Program Files\Pinta\bin\Pinta.exe',
+                os.path.expandvars(r'%LOCALAPPDATA%\Programs\Pinta\bin\Pinta.exe'),
+            ],
+        },
+        {
+            'key': 'paintnet', 'label': 'Paint.NET', 'icon': '\U0001f58c', 'custom': False,
+            'guesses': [
+                r'C:\Program Files\Paint.NET\paintdotnet.exe',
+                os.path.expandvars(r'%LOCALAPPDATA%\Programs\paint.net\paintdotnet.exe'),
+            ],
+        },
+    ] + [
+        {'key': f'custom{i}', 'label': f'Custom {i}', 'icon': '+', 'custom': True, 'guesses': []}
+        for i in range(1, 5)
+    ]
+
     def __init__(self, root):
         self.root = root
-        self.root.title('Texture Generator')
+        self.root.title(f'Texture Generator v{VERSION}')
         self.root.geometry(f'{self.W}x{self.H}')
         self.root.minsize(960, 680)
         self.root.configure(bg=C['bg'])
 
         self.input_dir   = tk.StringVar(value=os.getcwd())
         self.output_dir  = tk.StringVar(value=os.getcwd())
-        self.texconv_ok  = _pt.texconv_available()
+        self.texconv_ok  = os.path.isfile(texconv_exe())
         self.last_nm_path = None
+        self.external_tool_paths = load_external_tool_paths()
 
         self._setup_styles()
+        self._build_menu()
         self._build_ui()
 
     # ── Styles ────────────────────────────────────────────────────────────────
@@ -210,8 +465,10 @@ class TextureGeneratorApp:
         hdr = tk.Frame(self.root, bg='#131313', height=52)
         hdr.pack(fill='x'); hdr.pack_propagate(False)
         tk.Label(hdr, text='⬡  TEXTURE GENERATOR', bg='#131313', fg=C['text_bright'],
-                 font=('Segoe UI', 13, 'bold')).pack(side='left', padx=18, pady=10)
-        self.bsarch_ok  = _pt.bsarch_available()
+                 font=('Segoe UI', 13, 'bold')).pack(side='left', padx=(18, 6), pady=10)
+        tk.Label(hdr, text=f'v{VERSION}', bg='#131313', fg=C['text_dim'],
+                 font=('Segoe UI', 9, 'bold')).pack(side='left', pady=10)
+        self.bsarch_ok  = os.path.isfile(bsarch_exe())
         tc_col  = C['success'] if self.texconv_ok  else C['error']
         bsa_col = C['success'] if self.bsarch_ok   else C['error']
         tk.Label(hdr, text=f' {"✓" if self.texconv_ok else "✗"} texconv  ',
@@ -223,27 +480,37 @@ class TextureGeneratorApp:
         tk.Label(hdr, text=' ✓ PIL  ', bg='#1a1a1a', fg=C['success'],
                  font=('Segoe UI', 8, 'bold'), padx=6).pack(side='right', padx=2, pady=14)
 
-        # Input / Output bar
+        # Input / Output bar - shared defaults used by every tab that needs
+        # a folder (BSA, PBR, Material Generator, JSON Builder, etc. - see
+        # BUILD_README.md), so this stays global rather than moving into
+        # just the Texture Converters tab; it's shrunk to a fixed-width
+        # left column instead, freeing the rest of the row for quick-launch.
         dbar = tk.Frame(self.root, bg=C['surface'], height=54)
         dbar.pack(fill='x'); dbar.pack_propagate(False)
+
+        folder_col = tk.Frame(dbar, bg=C['surface'], width=460)
+        folder_col.pack(side='left', fill='y')
+        folder_col.pack_propagate(False)
+
         for i, (lbl, var, fn) in enumerate([
             ('Input Folder:',  self.input_dir,  self._browse_input),
             ('Output Folder:', self.output_dir, self._browse_output),
         ]):
-            row = tk.Frame(dbar, bg=C['surface'])
+            row = tk.Frame(folder_col, bg=C['surface'])
             row.pack(fill='x', padx=8, pady=(4 if i == 0 else 1, 0))
             tk.Label(row, text=lbl, bg=C['surface'], fg=C['text_dim'],
                      font=('Segoe UI', 8), width=13, anchor='w').pack(side='left', padx=(6,2))
             tk.Entry(row, textvariable=var, bg=C['input'], fg=C['text'],
                      insertbackground=C['text'], relief='flat', font=('Segoe UI', 8), bd=2
                      ).pack(side='left', fill='x', expand=True, padx=2)
-            tk.Button(row, text=' … ', command=fn,
-                      bg=C['accent'], fg='white',
-                      activebackground=C['accent_hi'], activeforeground='white',
-                      relief='flat', cursor='hand2', font=('Segoe UI', 9, 'bold'), padx=8, pady=1
-                      ).pack(side='right', padx=(4,6))
+            RoundedButton(row, text='…', command=fn,
+                          bg=C['accent'], fg='white', font=('Segoe UI', 9, 'bold'),
+                          pad=(10, 4)).pack(side='right', padx=(4,6))
 
-        # Notebook — 4 tabs
+        tk.Frame(dbar, bg=C['border'], width=1).pack(side='left', fill='y', pady=8)
+        self._build_quick_launch_bar(dbar)
+
+        # Notebook
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill='both', expand=True)
 
@@ -251,13 +518,17 @@ class TextureGeneratorApp:
         self.nb.add(t1, text='  Texture Converters  ')
         self._build_converters_tab(t1)
 
+        t_bsa = tk.Frame(self.nb, bg=C['surface'])
+        self.nb.add(t_bsa, text='  BSA Utilities  ')
+        self._build_bsa_tab(t_bsa)
+
         t2 = tk.Frame(self.nb, bg=C['surface'])
         self.nb.add(t2, text='  DDS Tool  ')
         self._build_dds_tool_tab(t2)
 
-        t_bsa = tk.Frame(self.nb, bg=C['surface'])
-        self.nb.add(t_bsa, text='  BSA Utilities  ')
-        self._build_bsa_tab(t_bsa)
+        t_resize = tk.Frame(self.nb, bg=C['surface'])
+        self.nb.add(t_resize, text='  Resize Tool  ')
+        self._build_resize_tool_tab(t_resize)
 
         t3 = tk.Frame(self.nb, bg=C['surface'])
         self.nb.add(t3, text='  Normal Map Generator  ')
@@ -268,7 +539,7 @@ class TextureGeneratorApp:
         self._build_pmap_tab(t_pmap)
 
         t4 = tk.Frame(self.nb, bg=C['surface'])
-        self.nb.add(t4, text='  PBR Batch Generator  ')
+        self.nb.add(t4, text='  ⚠  PBR Generator  ')
         self._build_pbr_tab(t4)
 
         t_dual = tk.Frame(self.nb, bg=C['surface'])
@@ -280,8 +551,8 @@ class TextureGeneratorApp:
         self._build_material_tab(t_mat)
 
         t_json = tk.Frame(self.nb, bg=C['surface'])
-        self.nb.add(t_json, text='  PBR JSON Builders  ')
-        self._build_pbr_json_split_tab(t_json)
+        self.nb.add(t_json, text='  PBR JSON Builder  ')
+        self._build_json_tab(t_json)
 
     # ── Background ────────────────────────────────────────────────────────────
     def _load_bg(self):
@@ -305,12 +576,10 @@ class TextureGeneratorApp:
 
     # ── Generic helpers ───────────────────────────────────────────────────────
     def _mkbtn(self, parent, text, cmd, bg=None, fg='white', pad=(12,6), font=None, **kw):
-        return tk.Button(parent, text=text, command=cmd,
-                         bg=bg or C['accent'], fg=fg,
-                         activebackground=C['accent_hi'], activeforeground='white',
-                         relief='flat', cursor='hand2', bd=0,
-                         font=font or ('Segoe UI', 9, 'bold'),
-                         padx=pad[0], pady=pad[1], **kw)
+        return RoundedButton(parent, text=text, command=cmd,
+                              bg=bg or C['accent'], fg=fg,
+                              font=font or ('Segoe UI', 9, 'bold'),
+                              pad=pad, **kw)
 
     def _section_lbl(self, p, title, sub='', bg=None):
         bg = bg or C['surface']
@@ -346,6 +615,42 @@ class TextureGeneratorApp:
         threading.Thread(target=fn, daemon=True).start()
 
     @staticmethod
+    def _bind_wheel_scroll(canvas, frame):
+        """Scope mousewheel scrolling to `canvas` while the pointer is
+        actually over it (or anything inside it), instead of grabbing it
+        globally forever. bind_all('<MouseWheel>') only supports ONE live
+        handler for the whole app - every scrollable pane calling it once
+        at build time meant whichever was built last silently owned wheel
+        scrolling everywhere (that's why, e.g., Material Generator's
+        preview grid on the right didn't scroll but its controls on the
+        left did - and Dual Layer Builder's grid never scrolled at all,
+        since it never even called bind_all). Enter/Leave toggling that
+        same global handler on and off, rebound onto every descendant
+        widget once the pane's contents exist, means each pane only
+        claims it while actually hovered."""
+        def _on_wheel(e):
+            canvas.yview_scroll(-1 * (e.delta // 120), 'units')
+
+        def _claim(_e=None):
+            canvas.bind_all('<MouseWheel>', _on_wheel)
+
+        def _release(_e=None):
+            canvas.unbind_all('<MouseWheel>')
+
+        def _bind_recursive(widget):
+            widget.bind('<Enter>', _claim, add='+')
+            widget.bind('<Leave>', _release, add='+')
+            for child in widget.winfo_children():
+                _bind_recursive(child)
+
+        canvas.bind('<Enter>', _claim, add='+')
+        canvas.bind('<Leave>', _release, add='+')
+        # `frame` gets populated with the pane's actual widgets by the
+        # caller AFTER this returns, so defer until Tk is idle (i.e. the
+        # pane's full contents already exist) before walking its children.
+        canvas.after_idle(lambda: _bind_recursive(frame))
+
+    @staticmethod
     def _make_scrollable(parent, bg):
         canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
         sb = ttk.Scrollbar(parent, orient='vertical', command=canvas.yview)
@@ -359,8 +664,7 @@ class TextureGeneratorApp:
                     lambda e, wid=win_id: canvas.itemconfig(wid, width=e.width))
         canvas.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-        canvas.bind_all('<MouseWheel>',
-                        lambda e: canvas.yview_scroll(-1*(e.delta//120), 'units'))
+        TextureGeneratorApp._bind_wheel_scroll(canvas, frame)
         return canvas, frame
 
     def _browse_input(self):
@@ -467,7 +771,7 @@ class TextureGeneratorApp:
                     bg=C['panel2'], fg=C['text_dim'], pad=(8,3),
                     font=('Segoe UI', 8)).pack(anchor='e', padx=8, pady=(0,8))
 
-        _, sf = self._make_scrollable(left, C['surface'])
+        self._dl_scroll_canvas, sf = self._make_scrollable(left, C['surface'])
         self._section_lbl(sf, 'FORMAT CONVERSIONS',
             'No ImageMagick required — uses PIL + texconv  |  Input → Output folder  |  Recursive')
 
@@ -520,33 +824,26 @@ class TextureGeneratorApp:
         for lbl, idx, col in [('Remove Red',   0, '#e74856'),
                                ('Remove Green', 1, '#4ec9b0'),
                                ('Remove Blue',  2, '#569cd6')]:
-            tk.Button(ch_row, text=lbl, command=lambda i=idx, n=lbl: self._rm_channel(i, n),
-                      bg=C['panel'], fg=col, activebackground=C['input'],
-                      activeforeground=col, relief='flat', cursor='hand2',
-                      font=('Segoe UI', 9, 'bold'), padx=14, pady=7, bd=0
-                      ).pack(side='left', padx=6, pady=4)
+            RoundedButton(ch_row, text=lbl, command=lambda i=idx, n=lbl: self._rm_channel(i, n),
+                          bg=col, fg='white', font=('Segoe UI', 9, 'bold'),
+                          pad=(14, 7)).pack(side='left', padx=6, pady=4)
 
         self._sep(sf)
         self._section_lbl(sf, 'FILE MANAGEMENT')
         keep_row = tk.Frame(sf, bg=C['surface'])
         keep_row.pack(fill='x', padx=16, pady=(0,6))
-        tk.Button(keep_row, text='Keep Only _n BMP', command=self._keep_n_bmps,
-                  bg=C['panel'], fg=C['warn'], activebackground=C['input'],
-                  activeforeground=C['warn'], relief='flat', cursor='hand2',
-                  font=('Segoe UI', 9, 'bold'), padx=14, pady=7, bd=0
-                  ).pack(side='left', padx=6, pady=4)
+        RoundedButton(keep_row, text='Keep Only _n BMP', command=self._keep_n_bmps,
+                      bg=C['warn'], fg='#1e1e1e', font=('Segoe UI', 9, 'bold'),
+                      pad=(14, 7)).pack(side='left', padx=6, pady=4)
         del_row = tk.Frame(sf, bg=C['surface'])
         del_row.pack(fill='x', padx=16, pady=(0,4))
         tk.Label(del_row, text='Delete all:',
                  bg=C['surface'], fg=C['text_dim'],
                  font=('Segoe UI', 8)).pack(side='left', padx=(0,8), pady=6)
         for ext in ['BMP','TGA','DDS','PNG']:
-            tk.Button(del_row, text=f' {ext} ',
-                      command=lambda e=ext.lower(): self._rm_ext(e),
-                      bg='#3a1515', fg=C['error'], activebackground='#5a2424',
-                      activeforeground=C['error'], relief='flat', cursor='hand2',
-                      font=('Segoe UI', 9,'bold'), padx=6, pady=5, bd=0
-                      ).pack(side='left', padx=4)
+            RoundedButton(del_row, text=ext, command=lambda e=ext.lower(): self._rm_ext(e),
+                          bg=C['error'], fg='white', font=('Segoe UI', 9, 'bold'),
+                          pad=(10, 5)).pack(side='left', padx=4)
         tk.Frame(sf, bg=C['surface'], height=16).pack()
 
     def _rm_channel(self, idx, name):
@@ -619,8 +916,8 @@ class TextureGeneratorApp:
         self._section_lbl(sf, 'DDS SMART COMPRESSOR',
             'Converts PNG or DDS → DDS using texconv. Assign formats per texture type below.')
 
-        src_var = self.input_dir
-        out_var = self.output_dir
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(sf, 'Source Folder', src_var)
         self._folder_row(sf, 'Output Folder', out_var)
 
@@ -733,12 +1030,10 @@ class TextureGeneratorApp:
             cb.grid(row=0, column=1, sticky='ew', padx=(0, 4), pady=5)
 
             # Delete button
-            tk.Button(row, text='×', bg=C['panel'], fg=C['error'],
-                      activebackground=C['input'], activeforeground=C['error'],
-                      relief='flat', cursor='hand2', font=('Segoe UI', 10, 'bold'),
-                      padx=4, pady=0, bd=0,
-                      command=lambda i=idx: self._remove_dds_rule(i)
-                      ).grid(row=0, column=2, padx=(0, 4), pady=5)
+            RoundedButton(row, text='×', bg=C['error'], fg='white',
+                          font=('Segoe UI', 10, 'bold'), pad=(6, 1),
+                          command=lambda i=idx: self._remove_dds_rule(i)
+                          ).grid(row=0, column=2, padx=(0, 4), pady=5)
 
     def _add_dds_rule(self):
         """Append a new blank rule row."""
@@ -829,6 +1124,250 @@ class TextureGeneratorApp:
         self._run_thread(run)
 
     # =========================================================================
+    # TAB 2b – RESIZE TOOL
+    # =========================================================================
+    def _build_resize_tool_tab(self, parent):
+        left_outer = tk.Frame(parent, bg=C['surface'], width=500)
+        left_outer.pack(side='left', fill='y')
+        left_outer.pack_propagate(False)
+        right = tk.Frame(parent, bg=C['panel'])
+        right.pack(side='right', fill='both', expand=True)
+
+        _, sf = self._make_scrollable(left_outer, C['surface'])
+
+        self._section_lbl(sf, 'RESIZE TOOL',
+            "Batch-resize each map type to its own target size - not one size "
+            "for everything. Classification is by filename suffix (same "
+            "convention as the PBR JSON Builder), and saving uses the same "
+            "rule-based DDS compression as DDS Tool.")
+
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
+        self._folder_row(sf, 'Source Folder', src_var)
+        self._folder_row(sf, 'Output Folder', out_var)
+
+        self._sep(sf)
+        tk.Label(sf, text='INPUT MODE', bg=C['surface'], fg=C['accent'],
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=16)
+        mode_var = tk.StringVar(value='png')
+        for val, lbl in [('png', 'PNG → DDS  (compress + resize source art)'),
+                         ('dds', 'DDS → DDS  (recompress + resize existing DDS)')]:
+            ttk.Radiobutton(sf, text=lbl, variable=mode_var, value=val,
+                            style='Dark.TRadiobutton').pack(anchor='w', padx=22, pady=2)
+
+        # ── Per-map-type size ─────────────────────────────────────────────────
+        self._sep(sf)
+        size_hdr = tk.Frame(sf, bg=C['surface'])
+        size_hdr.pack(fill='x', padx=16, pady=(0, 4))
+        tk.Label(size_hdr, text='PER-MAP SIZE', bg=C['surface'], fg=C['accent'],
+                 font=('Segoe UI', 9, 'bold')).pack(side='left')
+        self._mkbtn(size_hdr, '↺ Reset Sizes', self._rt_reset_sizes,
+                    bg=C['panel'], fg=C['text_dim'], pad=(8, 3),
+                    font=('Segoe UI', 8)).pack(side='right')
+
+        size_grid = tk.Frame(sf, bg=C['surface'])
+        size_grid.pack(fill='x', padx=16, pady=(0, 4))
+        size_grid.columnconfigure(0, weight=3)
+        size_grid.columnconfigure(1, weight=2)
+
+        self._rt_size_vars = {}
+        for r, (key, label, _sufs) in enumerate(_RESIZE_MAP_TYPES):
+            tk.Label(size_grid, text=label, bg=C['surface'], fg=C['text'],
+                     font=('Segoe UI', 8), anchor='w'
+                     ).grid(row=r, column=0, sticky='w', padx=(0, 8), pady=3)
+            var = tk.StringVar(value=_RESIZE_SIZE_CHOICES[0])
+            self._rt_size_vars[key] = var
+            ttk.Combobox(size_grid, textvariable=var, values=_RESIZE_SIZE_CHOICES,
+                         state='readonly', font=('Consolas', 8), width=18
+                         ).grid(row=r, column=1, sticky='ew', pady=3)
+        tk.Label(sf, text='"Original / No Resize" saves at native resolution - '
+                          'the file is still processed/compressed, just not resized.',
+                 bg=C['surface'], fg=C['text_dim'], font=('Segoe UI', 7),
+                 wraplength=460, justify='left').pack(anchor='w', padx=16, pady=(2, 0))
+
+        # ── Format assignment rules (same system + defaults as DDS Tool) ──────
+        self._sep(sf)
+        hdr_row = tk.Frame(sf, bg=C['surface'])
+        hdr_row.pack(fill='x', padx=16, pady=(0, 4))
+        tk.Label(hdr_row, text='FORMAT ASSIGNMENT RULES', bg=C['surface'], fg=C['accent'],
+                 font=('Segoe UI', 9, 'bold')).pack(side='left')
+        self._mkbtn(hdr_row, '↺ Reset', self._rt_reset_rules,
+                    bg=C['panel'], fg=C['text_dim'], pad=(8, 3),
+                    font=('Segoe UI', 8)).pack(side='right')
+        self._mkbtn(hdr_row, '+ Add Rule', self._rt_add_rule,
+                    bg=C['panel'], fg=C['text'], pad=(8, 3),
+                    font=('Segoe UI', 8)).pack(side='right', padx=(0, 6))
+
+        col_hdr = tk.Frame(sf, bg=C['surface'])
+        col_hdr.pack(fill='x', padx=16, pady=(0, 2))
+        col_hdr.columnconfigure(0, weight=3)
+        col_hdr.columnconfigure(1, weight=4)
+        col_hdr.columnconfigure(2, minsize=24)
+        for c, h in enumerate(['Suffix(es)  (comma-separated)', 'DDS Format', '']):
+            tk.Label(col_hdr, text=h, bg=C['surface'], fg=C['text_dim'],
+                     font=('Segoe UI', 7, 'bold'), anchor='w'
+                     ).grid(row=0, column=c, sticky='ew', padx=(0, 4))
+
+        self._rt_rules_container = tk.Frame(sf, bg=C['surface'])
+        self._rt_rules_container.pack(fill='x', padx=16, pady=(0, 4))
+
+        self._rt_rule_vars = []
+        self._rt_init_rules()
+        self._rt_rebuild_rules_ui()
+
+        self._sep(sf)
+        def_row = tk.Frame(sf, bg=C['surface'])
+        def_row.pack(fill='x', padx=16, pady=(0, 4))
+        tk.Label(def_row, text='Default (unmatched files):', bg=C['surface'],
+                 fg=C['text_dim'], font=('Segoe UI', 8)).pack(side='left', padx=(0, 8))
+        self._rt_default_var = tk.StringVar(value=_DDS_DEFAULT[0])
+        ttk.Combobox(def_row, textvariable=self._rt_default_var,
+                     values=_DDS_FMT_OPTIONS, state='readonly',
+                     font=('Consolas', 8), width=20
+                     ).pack(side='left')
+        tk.Label(def_row, text='← Albedo / Diffuse', bg=C['surface'],
+                 fg=C['text_dim'], font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
+
+        self._sep(sf)
+        self._mkbtn(sf, '▶  Run Resize + Compress',
+                    lambda: self._run_resize_tool(src_var, out_var, mode_var),
+                    pad=(16, 10), font=('Segoe UI', 10, 'bold')
+                    ).pack(fill='x', padx=16, pady=6)
+        tk.Frame(sf, bg=C['surface'], height=12).pack()
+
+        tk.Label(right, text='PROCESSING LOG', bg=C['panel'], fg=C['text_dim'],
+                 font=('Consolas', 8, 'bold')).pack(anchor='w', padx=10, pady=(10, 2))
+        self.resize_log = self._console(right)
+        self.resize_log.pack(fill='both', expand=True, padx=8, pady=4)
+        self.resize_prog = tk.DoubleVar(value=0)
+        ttk.Progressbar(right, variable=self.resize_prog, maximum=100
+                        ).pack(fill='x', padx=8, pady=(0, 4))
+        self._mkbtn(right, 'Clear', lambda: self._clear_log(self.resize_log),
+                    bg=C['panel2'], fg=C['text_dim'], pad=(8, 3),
+                    font=('Segoe UI', 8)).pack(anchor='e', padx=8, pady=(0, 8))
+
+    # ── Resize Tool: per-map size management ────────────────────────────────
+    def _rt_reset_sizes(self):
+        for var in getattr(self, '_rt_size_vars', {}).values():
+            var.set(_RESIZE_SIZE_CHOICES[0])
+
+    # ── Resize Tool: format rule management (mirrors DDS Tool's, kept as its
+    # own independent state so editing one tab's rules never affects the
+    # other) ─────────────────────────────────────────────────────────────────
+    def _rt_init_rules(self):
+        self._rt_rule_vars = []
+        for suffixes, fmt, _ in _DDS_RULES:
+            sv = tk.StringVar(value=', '.join(suffixes))
+            fv = tk.StringVar(value=fmt)
+            self._rt_rule_vars.append((sv, fv))
+
+    def _rt_rebuild_rules_ui(self):
+        for w in self._rt_rules_container.winfo_children():
+            w.destroy()
+
+        for idx, (sv, fv) in enumerate(self._rt_rule_vars):
+            row = tk.Frame(self._rt_rules_container, bg=C['panel'])
+            row.pack(fill='x', pady=2)
+            row.columnconfigure(0, weight=3)
+            row.columnconfigure(1, weight=4)
+            row.columnconfigure(2, minsize=26)
+
+            tk.Entry(row, textvariable=sv, bg=C['input'], fg=C['text'],
+                     insertbackground=C['text'], relief='flat',
+                     font=('Segoe UI', 8)
+                     ).grid(row=0, column=0, sticky='ew', padx=(6, 4), pady=5)
+
+            ttk.Combobox(row, textvariable=fv, values=_DDS_FMT_OPTIONS,
+                         state='readonly', font=('Consolas', 8), width=18
+                         ).grid(row=0, column=1, sticky='ew', padx=(0, 4), pady=5)
+
+            RoundedButton(row, text='×', bg=C['error'], fg='white',
+                          font=('Segoe UI', 10, 'bold'), pad=(6, 1),
+                          command=lambda i=idx: self._rt_remove_rule(i)
+                          ).grid(row=0, column=2, padx=(0, 4), pady=5)
+
+    def _rt_add_rule(self):
+        self._rt_rule_vars.append((tk.StringVar(value='_suffix'),
+                                   tk.StringVar(value='BC7_UNORM')))
+        self._rt_rebuild_rules_ui()
+
+    def _rt_remove_rule(self, idx):
+        if 0 <= idx < len(self._rt_rule_vars):
+            self._rt_rule_vars.pop(idx)
+            self._rt_rebuild_rules_ui()
+
+    def _rt_reset_rules(self):
+        self._rt_init_rules()
+        self._rt_rebuild_rules_ui()
+        if hasattr(self, '_rt_default_var'):
+            self._rt_default_var.set(_DDS_DEFAULT[0])
+
+    def _run_resize_tool(self, src_var, out_var, mode_var):
+        if not self._need_texconv(self.resize_log):
+            return
+
+        rule_snapshot = [(sv.get(), fv.get()) for sv, fv in self._rt_rule_vars]
+        default_fmt = getattr(self, '_rt_default_var',
+                              type('', (), {'get': lambda s: _DDS_DEFAULT[0]})()
+                              ).get()
+        size_snapshot = {k: v.get() for k, v in self._rt_size_vars.items()}
+
+        def resolve_fmt(filename):
+            stem = Path(filename).stem.lower()
+            for suffixes_str, fmt in rule_snapshot:
+                for s in [x.strip() for x in suffixes_str.split(',') if x.strip()]:
+                    if stem.endswith(s):
+                        return fmt
+            return default_fmt
+
+        def run():
+            self._clear_log(self.resize_log); self.resize_prog.set(0)
+            src = Path(src_var.get())
+            out = Path(out_var.get())
+            ext = '.dds' if mode_var.get() == 'dds' else '.png'
+            files = [f for f in src.rglob(f'*{ext}') if f.is_file()]
+            if not files:
+                self._log(self.resize_log, f'No {ext.upper()} files in: {src}', C['warn'])
+                return
+
+            mode_label = 'DDS→DDS recompress' if mode_var.get() == 'dds' else 'PNG→DDS compress'
+            self._log(self.resize_log,
+                      f'Mode:   {mode_label}\n'
+                      f'Source: {src}\n'
+                      f'Output: {out}\n'
+                      f'Found:  {len(files)} file(s)\n')
+            ok = fail = 0
+            for i, f in enumerate(files, 1):
+                cat = resize_classify(f.name)
+                size_choice = size_snapshot.get(cat, _RESIZE_SIZE_CHOICES[0])
+                fmt = resolve_fmt(f.name)
+                rel = f.relative_to(src)
+                out_dir = out / rel.parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                dst = out_dir / (f.stem + '.dds')
+
+                w = h = None
+                size_label = 'original'
+                if size_choice != _RESIZE_SIZE_CHOICES[0]:
+                    w = h = int(size_choice)
+                    size_label = f'{w}x{h}'
+
+                self._log(self.resize_log, f'  {rel}  [{cat}]  →  {fmt}  @ {size_label}')
+                try:
+                    if _tc_compress(str(f), str(dst), fmt, width=w, height=h):
+                        self._log(self.resize_log, '    ✓', C['success']); ok += 1
+                    else:
+                        self._log(self.resize_log, '    ✗ texconv failed', C['error']); fail += 1
+                except Exception as e:
+                    self._log(self.resize_log, f'    ✗ {e}', C['error']); fail += 1
+                self.root.after(0, lambda p=i / len(files) * 100: self.resize_prog.set(p))
+
+            self.resize_prog.set(100)
+            self._log(self.resize_log,
+                      f'\nDone — {ok} succeeded, {fail} failed.', C['success'])
+        self._run_thread(run)
+
+    # =========================================================================
     # TAB 3 – BSA UTILITIES
     # =========================================================================
     def _build_bsa_tab(self, parent):
@@ -856,11 +1395,9 @@ class TextureGeneratorApp:
                 title='Select BSA / BA2 archive',
                 filetypes=[('Bethesda Archives', '*.bsa *.ba2'), ('All files', '*.*')])
             if f: self._bsa_file_var.set(os.path.normpath(f))
-        tk.Button(fr, text=' Browse… ', command=_pick_bsa,
-                  bg=C['accent'], fg='white',
-                  activebackground=C['accent_hi'], activeforeground='white',
-                  relief='flat', cursor='hand2', font=('Segoe UI', 8, 'bold'),
-                  padx=8, pady=4, bd=0).pack(side='right')
+        RoundedButton(fr, text='Browse…', command=_pick_bsa,
+                      bg=C['accent'], fg='white', font=('Segoe UI', 8, 'bold'),
+                      pad=(10, 5)).pack(side='right')
 
         # ── Info buttons ──────────────────────────────────────────────────────
         self._sep(sf)
@@ -895,7 +1432,7 @@ class TextureGeneratorApp:
         self._section_lbl(sf, 'UNPACK',
             'Extract all files from the archive to the chosen output folder.')
 
-        self._bsa_unpack_var = self.output_dir
+        self._bsa_unpack_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(sf, 'Output Folder', self._bsa_unpack_var)
 
         self._mkbtn(sf, '📦  Unpack Archive', self._bsa_unpack,
@@ -926,11 +1463,9 @@ class TextureGeneratorApp:
                 defaultextension='.bsa',
                 filetypes=[('BSA Archive','*.bsa'), ('BA2 Archive','*.ba2'), ('All','*.*')])
             if f: self._bsa_out_var.set(os.path.normpath(f))
-        tk.Button(out_row, text=' … ', command=_pick_bsa_out,
-                  bg=C['accent'], fg='white',
-                  activebackground=C['accent_hi'], activeforeground='white',
-                  relief='flat', cursor='hand2', font=('Segoe UI', 9, 'bold'),
-                  padx=6, bd=0).pack(side='right')
+        RoundedButton(out_row, text='…', command=_pick_bsa_out,
+                      bg=C['accent'], fg='white', font=('Segoe UI', 9, 'bold'),
+                      pad=(10, 4)).pack(side='right')
 
         # Format selector
         fmt_row = tk.Frame(sf, bg=C['surface']); fmt_row.pack(fill='x', padx=16, pady=(6, 2))
@@ -1041,7 +1576,7 @@ class TextureGeneratorApp:
             self._log(self.bsa_log, f'{log_prefix}…')
             try:
                 result = subprocess.run(
-                    _pt.bsarch_command(args),
+                    [bsarch_exe()] + args,
                     capture_output=True, text=True, timeout=600)
 
                 all_lines = (result.stdout + result.stderr).splitlines()
@@ -1125,11 +1660,9 @@ class TextureGeneratorApp:
         def _browse(v=var):
             d = filedialog.askdirectory(initialdir=v.get() or self.input_dir.get())
             if d: v.set(os.path.normpath(d))
-        tk.Button(row, text=' … ', command=_browse,
-                  bg=C['accent'], fg='white',
-                  activebackground=C['accent_hi'], activeforeground='white',
-                  relief='flat', cursor='hand2', font=('Segoe UI', 9, 'bold'), padx=6
-                  ).pack(side='right')
+        RoundedButton(row, text='…', command=_browse,
+                      bg=C['accent'], fg='white', font=('Segoe UI', 9, 'bold'),
+                      pad=(10, 4)).pack(side='right')
 
     # =========================================================================
     # TAB 3 – NORMAL MAP GENERATOR  (BMP + DDS in, BMP/TGA/PNG/DDS out)
@@ -1155,9 +1688,9 @@ class TextureGeneratorApp:
                                       fg=C['text_bright'], font=('Consolas', 10,'bold'), width=5)
         self._nm_scale_lbl.pack(side='right')
         tk.Scale(sr, from_=0.5, to=50.0, resolution=0.5, orient='horizontal',
-                 variable=self.nm_scale, bg=C['surface'], fg=C['text'],
-                 troughcolor=C['input'], highlightthickness=0, activebackground=C['accent'],
-                 showvalue=False, sliderlength=18,
+                 variable=self.nm_scale, bg=C['accent'], fg=C['text'],
+                 troughcolor=C['input'], highlightthickness=0, activebackground=C['accent_hi'],
+                 showvalue=False, sliderlength=18, sliderrelief='raised', bd=1,
                  command=lambda v: self._nm_scale_lbl.config(text=f'{float(v):.1f}')
                  ).pack(fill='x', expand=True)
 
@@ -1351,18 +1884,233 @@ class TextureGeneratorApp:
     def _open_out(self):
         d = self.output_dir.get()
         if os.path.isdir(d):
-            try: _pt.open_in_file_manager(d)
+            try: os.startfile(d)
             except Exception: subprocess.Popen(['explorer', d])
+
+    # ── Quick-launch external apps (Upscayl, Pinta, Paint.NET, + custom) ────
+    def _build_quick_launch_bar(self, parent):
+        """Small, extensible row of icon buttons that launch external apps
+        directly. Left-click launches (browsing to the exe once if it
+        can't be found automatically or from a previously saved path -
+        custom slots also ask for a short display name at that point;
+        that path/name is then remembered in external_tools.json).
+        Right-click changes the remembered path (and name, for custom
+        slots). Rebuilds itself from EXTERNAL_TOOLS - add an app there,
+        not here, to add a new fixed icon."""
+        bar = tk.Frame(parent, bg=C['surface'])
+        bar.pack(side='left', fill='both', expand=True, padx=(10, 8), pady=8)
+        self.quick_launch_bar = bar
+        self._tool_buttons = {}
+        self._tool_tooltips = {}
+
+        tk.Label(bar, text='QUICK LAUNCH', bg=C['surface'], fg=C['text_dim'],
+                 font=('Segoe UI', 7, 'bold')).pack(side='left', padx=(0, 10))
+
+        for tool in self.EXTERNAL_TOOLS:
+            btn = RoundedButton(bar, text=self._tool_glyph(tool),
+                                 command=lambda t=tool: self._launch_external_tool(t),
+                                 bg=C['panel2'], fg=C['text_bright'], font=('Segoe UI', 12, 'bold'),
+                                 pad=(6, 4), width=34)
+            btn.pack(side='left', padx=3)
+            btn.bind('<Button-3>', lambda e, t=tool: self._change_tool_path(t))
+            self._tool_buttons[tool['key']] = btn
+            self._tool_tooltips[tool['key']] = _Tooltip(btn, self._tool_tooltip_text(tool))
+
+    def _tool_glyph(self, tool):
+        """Fixed apps always show their own icon glyph. Blank custom slots
+        show '+' until configured, then show the first letter of whatever
+        name the user gave it - RoundedButton is single-glyph, so this is
+        the compact way to make a configured custom slot recognizable at
+        a glance."""
+        if tool.get('custom'):
+            entry = self.external_tool_paths.get(tool['key'])
+            if isinstance(entry, dict) and entry.get('label'):
+                return entry['label'][0].upper()
+            return tool['icon']
+        return tool['icon']
+
+    def _tool_tooltip_text(self, tool):
+        label = self.get_tool_label(tool)
+        return f'Launch {label}  (right-click to set/change its .exe path{" and name" if tool.get("custom") else ""})'
+
+    def _refresh_tool_button(self, tool):
+        btn = self._tool_buttons.get(tool['key'])
+        if btn:
+            btn.configure(text=self._tool_glyph(tool))
+        tip = self._tool_tooltips.get(tool['key'])
+        if tip:
+            tip.text = self._tool_tooltip_text(tool)
+
+    def get_tool_label(self, tool):
+        entry = self.external_tool_paths.get(tool['key'])
+        if isinstance(entry, dict) and entry.get('label'):
+            return entry['label']
+        return tool['label']
+
+    def get_tool_path(self, key):
+        entry = self.external_tool_paths.get(key)
+        if isinstance(entry, dict):
+            return entry.get('path')
+        if isinstance(entry, str):   # tolerate a bare-string entry too
+            return entry
+        return None
+
+    def set_tool_path(self, key, path, label=None):
+        entry = self.external_tool_paths.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        entry['path'] = path
+        if label is not None:
+            entry['label'] = label
+        self.external_tool_paths[key] = entry
+        save_external_tool_paths(self.external_tool_paths)
+
+    def _resolve_tool_path(self, tool):
+        """Saved path first, then default-install guesses, else None."""
+        saved = self.get_tool_path(tool['key'])
+        if saved and os.path.isfile(saved):
+            return saved
+        return next((g for g in tool['guesses'] if os.path.isfile(g)), None)
+
+    def _launch_external_tool(self, tool):
+        path = self._resolve_tool_path(tool)
+        if not path:
+            if tool.get('custom'):
+                dlg = _CustomToolDialog(self.root, initial_name=self._current_custom_label(tool))
+                if not dlg.result:
+                    return
+                label, path = dlg.result
+            else:
+                path = filedialog.askopenfilename(
+                    title=f"Locate the .exe for {tool['label']}",
+                    filetypes=[('Executable', '*.exe'), ('All files', '*.*')])
+                if not path:
+                    return
+                label = None
+            self.set_tool_path(tool['key'], path, label)
+            self._refresh_tool_button(tool)
+        try:
+            os.startfile(path)
+        except Exception:
+            try:
+                subprocess.Popen([path])
+            except Exception as e:
+                messagebox.showerror(f"Couldn't launch {self.get_tool_label(tool)}", str(e))
+
+    def _change_tool_path(self, tool):
+        if tool.get('custom'):
+            dlg = _CustomToolDialog(self.root, initial_name=self._current_custom_label(tool),
+                                     initial_path=self.get_tool_path(tool['key']) or '')
+            if not dlg.result:
+                return
+            label, path = dlg.result
+        else:
+            path = filedialog.askopenfilename(
+                title=f"Locate the .exe for {tool['label']}",
+                filetypes=[('Executable', '*.exe'), ('All files', '*.*')])
+            if not path:
+                return
+            label = None
+        self.set_tool_path(tool['key'], path, label)
+        self._refresh_tool_button(tool)
+        messagebox.showinfo(label or tool['label'], f'Path saved:\n{path}')
+
+    def _current_custom_label(self, tool):
+        """Only pre-fill the name field with something the user actually
+        typed before - not the generic 'Custom 1' placeholder."""
+        label = self.get_tool_label(tool)
+        return '' if label == tool['label'] else label
+
+    # ── Menu bar (File / View / Help) ────────────────────────────────────────
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label='Set Input Folder…', command=self._browse_input)
+        file_menu.add_command(label='Set Output Folder…', command=self._browse_output)
+        file_menu.add_separator()
+        file_menu.add_command(label='Open Output Folder', command=self._open_out)
+        file_menu.add_separator()
+        file_menu.add_command(label='Exit', command=self.root.destroy)
+        menubar.add_cascade(label='File', menu=file_menu)
+
+        self._always_on_top = tk.BooleanVar(value=False)
+        self._show_quick_launch = tk.BooleanVar(value=True)
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_checkbutton(
+            label='Always on Top', variable=self._always_on_top,
+            command=lambda: self.root.attributes('-topmost', self._always_on_top.get()))
+        view_menu.add_checkbutton(
+            label='Show Quick Launch Bar', variable=self._show_quick_launch,
+            command=self._toggle_quick_launch_bar)
+        view_menu.add_separator()
+        view_menu.add_command(label='Reset Window Size',
+                               command=lambda: self.root.geometry(f'{self.W}x{self.H}'))
+        menubar.add_cascade(label='View', menu=view_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label='Tool Status (PIL / texconv / BSArch / quick-launch apps)',
+                               command=self._show_tool_status)
+        help_menu.add_command(label='Open Build Guide (BUILD_README.md)',
+                               command=self._open_build_readme)
+        help_menu.add_separator()
+        help_menu.add_command(label='About Texture Generator', command=self._show_about)
+        menubar.add_cascade(label='Help', menu=help_menu)
+
+        self.root.config(menu=menubar)
+
+    def _toggle_quick_launch_bar(self):
+        if self._show_quick_launch.get():
+            self.quick_launch_bar.pack(side='left', fill='both', expand=True, padx=(10, 8), pady=8)
+        else:
+            self.quick_launch_bar.pack_forget()
+
+    def _show_tool_status(self):
+        lines = [
+            'PIL          : available',
+            f'texconv.exe  : {"found" if self.texconv_ok else "NOT FOUND"}',
+            f'BSArch.exe   : {"found" if getattr(self, "bsarch_ok", False) else "NOT FOUND"}',
+            '',
+        ]
+        for tool in self.EXTERNAL_TOOLS:
+            p = self._resolve_tool_path(tool)
+            label = self.get_tool_label(tool)
+            status = p if p else ('not set - click its icon or right-click to set it' if not tool.get('custom')
+                                   else 'blank slot - click to name it and set an .exe')
+            lines.append(f'{label:<12}: {status}')
+        messagebox.showinfo('Tool Status', '\n'.join(lines))
+
+    def _open_build_readme(self):
+        path = os.path.join(app_config_dir(), 'BUILD_README.md')
+        if os.path.isfile(path):
+            try: os.startfile(path)
+            except Exception: subprocess.Popen(['notepad', path])
+        else:
+            messagebox.showinfo('Build Guide', 'BUILD_README.md was not found next to this app.')
+
+    def _show_about(self):
+        messagebox.showinfo(
+            'About',
+            f'Texture Generator  v{VERSION}\n\n'
+            'Batch texture / material / PBR tooling, with quick-launch\n'
+            'bridges to Upscayl and Pinta.\n\n'
+            f'PIL: available    texconv: {"found" if self.texconv_ok else "missing"}    '
+            f'BSArch: {"found" if getattr(self, "bsarch_ok", False) else "missing"}')
 
     # =========================================================================
     # TAB 4 – PBR GENERATION
     # =========================================================================
     def _build_pbr_tab(self, parent):
+        banner = tk.Frame(parent, bg='#2a1800', height=30)
+        banner.pack(fill='x'); banner.pack_propagate(False)
+        tk.Label(banner,
+                 text='⚠  AI-assisted PBR generation — review all outputs before production use.',
+                 bg='#2a1800', fg=C['exp'],
+                 font=('Segoe UI', 8,'bold')).pack(side='left', padx=14, pady=6)
         if not _PBR_OK:
             tk.Label(parent,
-                     text='pbr_engine.py not found — place it alongside this executable.',
+                     text=f'pbr_engine.py failed to load:\n{_PBR_ERR}',
                      bg=C['surface'], fg=C['error'],
-                     font=('Segoe UI', 10)).pack(expand=True)
+                     font=('Segoe UI', 10), justify='left').pack(expand=True)
             return
         nb2 = ttk.Notebook(parent); nb2.pack(fill='both', expand=True)
         for label, fn in [
@@ -1375,47 +2123,46 @@ class TextureGeneratorApp:
             nb2.add(tab, text=f'  {label}  ')
             fn(tab)
 
-    # =========================================================================
-    # TAB – PBR JSON BUILDERS (split: engine-native builder | Step1/Step2 port)
-    # =========================================================================
-    def _build_pbr_json_split_tab(self, parent):
-        left_half = tk.Frame(parent, bg=C['surface'])
-        left_half.pack(side='left', fill='both', expand=True)
-        sep = tk.Frame(parent, bg=C['border'], width=2)
-        sep.pack(side='left', fill='y')
-        right_half = tk.Frame(parent, bg=C['surface'])
-        right_half.pack(side='left', fill='both', expand=True)
-
-        if not _PBR_OK:
-            tk.Label(parent,
-                     text='pbr_engine.py not found — place it alongside this executable.',
-                     bg=C['surface'], fg=C['error'],
-                     font=('Segoe UI', 10)).pack(expand=True)
-            return
-
-        self._pbr_json_tab(left_half)        # existing combined-JSON builder
-        self._pbr_json_ps1_tab(right_half)    # Step1.ps1 + Step2.ps1 port (one JSON per texture)
-
     def _pbr_layout(self, parent, title, desc):
-        left = tk.Frame(parent, bg=C['surface'], width=440)
-        left.pack(side='left', fill='y'); left.pack_propagate(False)
-        right = tk.Frame(parent, bg=C['panel'])
-        right.pack(side='right', fill='both', expand=True)
-        tk.Label(left, text=title, bg=C['surface'], fg=C['accent'],
-                 font=('Segoe UI', 10,'bold')).pack(anchor='w', padx=16, pady=(14,1))
-        tk.Label(left, text=desc, bg=C['surface'], fg=C['text_dim'],
-                 font=('Segoe UI', 8), wraplength=390, justify='left'
-                 ).pack(anchor='w', padx=16, pady=(0,10))
+        container = tk.Frame(parent, bg=C['bg'])
+        container.pack(fill='both', expand=True)
+        container.columnconfigure(0, weight=1, minsize=360)
+        container.columnconfigure(1, weight=2)
+        container.rowconfigure(0, weight=1)
+
+        left_wrapper = tk.Frame(container, bg=C['surface'])
+        left_wrapper.grid(row=0, column=0, sticky='nsew', padx=(0,1))
+        left_wrapper.columnconfigure(0, weight=1)
+        left_wrapper.rowconfigure(0, weight=1)
+
+        left_canvas, left = self._make_scrollable(left_wrapper, C['surface'])
+
+        right = tk.Frame(container, bg=C['panel'])
+        right.grid(row=0, column=1, sticky='nsew')
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
         tk.Label(right, text='PROCESSING LOG', bg=C['panel'], fg=C['text_dim'],
                  font=('Consolas', 8,'bold')).pack(anchor='w', padx=10, pady=(10,2))
         log_w = self._console(right)
         log_w.pack(fill='both', expand=True, padx=8, pady=4)
+
+        bot = tk.Frame(right, bg=C['panel'])
+        bot.pack(fill='x', padx=8, pady=(0,8))
         pv = tk.DoubleVar(value=0)
-        ttk.Progressbar(right, variable=pv, maximum=100).pack(fill='x', padx=8, pady=(0,4))
-        self._mkbtn(right, 'Clear', lambda: self._clear_log(log_w),
+        ttk.Progressbar(bot, variable=pv, maximum=100).pack(side='left', fill='x', expand=True, padx=(0,8))
+        self._mkbtn(bot, 'Clear', lambda: self._clear_log(log_w),
                     bg=C['panel2'], fg=C['text_dim'], pad=(8,3),
-                    font=('Segoe UI', 8)).pack(anchor='e', padx=8, pady=(0,8))
+                    font=('Segoe UI', 8)).pack(side='right')
+
+        tk.Label(left, text=title, bg=C['surface'], fg=C['accent'],
+                 font=('Segoe UI', 10,'bold')).pack(anchor='w', padx=16, pady=(14,1))
+        tk.Label(left, text=desc, bg=C['surface'], fg=C['text_dim'],
+                 font=('Segoe UI', 8), wraplength=380, justify='left'
+                 ).pack(anchor='w', padx=16, pady=(0,10))
+
         return left, log_w, pv
+
 
     def _slider_row(self, parent, label, lo, hi, res, default, w=14):
         row = tk.Frame(parent, bg=C['surface']); row.pack(fill='x', padx=16, pady=3)
@@ -1426,8 +2173,10 @@ class TextureGeneratorApp:
                        fg=C['text_bright'], font=('Consolas', 8), width=6)
         lbl.pack(side='right')
         tk.Scale(row, from_=lo, to=hi, resolution=res, orient='horizontal',
-                 variable=var, bg=C['surface'], fg=C['text'],
-                 troughcolor=C['input'], highlightthickness=0, showvalue=False, sliderlength=14,
+                 variable=var, bg=C['accent'], fg=C['text'],
+                 activebackground=C['accent_hi'], troughcolor=C['input'],
+                 highlightthickness=0, showvalue=False, sliderlength=16,
+                 sliderrelief='raised', bd=1,
                  command=lambda v, l=lbl: l.config(text=f'{float(v):.3f}')
                  ).pack(fill='x', expand=True, padx=(0,4))
         return var
@@ -1451,7 +2200,68 @@ class TextureGeneratorApp:
                 self.root.after(0, lambda: self._log(log_w, f'\nError: {e}', C['error']))
         threading.Thread(target=run, daemon=True).start()
 
-    def _chk_tc(self):
+    def _run_ps_script(self, script_rel, ps_args, log_w, pv, done_msg='Done.', on_complete=None):
+        """Runs a bundled PowerShell script (Step1.ps1 / Step2.ps1), streaming
+        its output into log_w and parsing __SKYKING_TOTAL__/__SKYKING_PROGRESS__
+        markers for the progress bar — same conventions as _run_pbr_op above,
+        just backed by a subprocess instead of an in-process Python call.
+        on_complete(success: bool) is invoked on the Tk thread once the
+        process exits, so callers can chain steps without guessing timing."""
+        def _log(msg, c=None):
+            fg = {'success': C['success'], 'warn': C['warn'], 'error': C['error']}.get(c)
+            self.root.after(0, lambda: self._log(log_w, msg, fg))
+        def _prog(done, total):
+            self.root.after(0, lambda: pv.set(done / total * 100 if total else 0))
+
+        def run():
+            self._clear_log(log_w); pv.set(0)
+            ps = powershell_exe()
+            script = resource_path(script_rel)
+            if not os.path.isfile(ps):
+                _log(f'powershell.exe not found (expected at {ps}). Rebuild to bundle it.', 'error')
+                if on_complete: self.root.after(0, lambda: on_complete(False))
+                return
+            if not os.path.isfile(script):
+                _log(f'{script_rel} not found (expected at {script}). Rebuild to bundle it.', 'error')
+                if on_complete: self.root.after(0, lambda: on_complete(False))
+                return
+            cmd = [ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script] + [str(a) for a in ps_args]
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, creationflags=creationflags)
+                for line in proc.stdout:
+                    line = line.rstrip('\n')
+                    if not line:
+                        continue
+                    if line.startswith('__SKYKING_TOTAL__='):
+                        continue  # total alone isn't actionable; wait for a progress line
+                    if line.startswith('__SKYKING_PROGRESS__='):
+                        try:
+                            done, tot = line.split('=', 1)[1].split('/')
+                            _prog(int(done), int(tot))
+                        except ValueError:
+                            pass
+                        continue
+                    color = 'error' if line.startswith(('[ERROR]', '❌', 'ERROR')) else \
+                            ('warn' if line.startswith(('[WARN]',)) else
+                            ('success' if line.startswith(('[DONE]', '✅', '✔')) else None))
+                    _log(line, color)
+                proc.wait()
+                ok = (proc.returncode == 0)
+                if ok:
+                    self.root.after(0, lambda: pv.set(100))
+                    self.root.after(0, lambda: self._log(log_w, f'\n{done_msg}', C['success']))
+                else:
+                    self.root.after(0, lambda: self._log(log_w,
+                        f'\nScript exited with code {proc.returncode}.', C['error']))
+                if on_complete:
+                    self.root.after(0, lambda: on_complete(ok))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(log_w, f'\nError: {e}', C['error']))
+                if on_complete:
+                    self.root.after(0, lambda: on_complete(False))
+        threading.Thread(target=run, daemon=True).start()
         if not self.texconv_ok:
             messagebox.showerror('texconv Missing',
                 'texconv.exe not found. Rebuild to bundle it inside the exe.')
@@ -1462,8 +2272,8 @@ class TextureGeneratorApp:
         left, log_w, pv = self._pbr_layout(parent, 'PBR BUILDER',
             'Convert loose PBR maps (albedo, normal, roughness, metalness, AO, height) '
             'into packed Community Shaders DDS files.')
-        src_var = self.input_dir
-        out_var = self.output_dir
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(left, 'Source Folder', src_var)
         self._folder_row(left, 'Output Folder', out_var)
         self._sep(left)
@@ -1480,7 +2290,7 @@ class TextureGeneratorApp:
                  font=('Segoe UI', 8), justify='left').pack(anchor='w', padx=16, pady=(4,8))
         self._sep(left)
         self._mkbtn(left, '▶  Build PBR Textures',
-                    lambda: self._chk_tc() and self._run_pbr_op(
+                    lambda: self._need_texconv(log_w) and self._run_pbr_op(
                         _pe.run_build_pbr, log_w, pv,
                         src_var.get(), out_var.get(), flip_var.get(),
                         done_msg='PBR Builder complete.'),
@@ -1490,8 +2300,8 @@ class TextureGeneratorApp:
         left, log_w, pv = self._pbr_layout(parent, 'PARALLAX GENERATOR',
             'Generate Complex Parallax _m and/or CS PBR textures from diffuse + normal. '
             'Height is derived via FFT if not present in source.')
-        src_var = self.input_dir
-        out_var = self.output_dir
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(left, 'Source Folder', src_var)
         self._folder_row(left, 'Output Folder', out_var)
         self._sep(left)
@@ -1521,7 +2331,7 @@ class TextureGeneratorApp:
                  ).pack(side='left', fill='x', expand=True)
         self._sep(left)
         def run():
-            if not self._chk_tc(): return
+            if not self._need_texconv(log_w): return
             excl = [x.strip() for x in excl_var.get().split(',') if x.strip()]
             cfg  = {'default': {k: v.get() for k, v in sliders.items()}, 'exclude': excl}
             self._run_pbr_op(_pe.run_generate_parallax, log_w, pv,
@@ -1530,10 +2340,35 @@ class TextureGeneratorApp:
         self._mkbtn(left, '▶  Generate Parallax Textures', run,
                     pad=(16,10), font=('Segoe UI', 10,'bold')).pack(fill='x', padx=16, pady=6)
 
-    def _pbr_json_tab(self, parent):
-        left, log_w, pv = self._pbr_layout(parent, 'PBR JSON BUILDER',
-            'Scan mod folder for complete PBR sets (diffuse + normal + _p + _rmaos) '
-            'and write a PBRNIFPatcher JSON to <mod>/PBRNIFPatcher/<name>.json')
+    def _build_json_tab(self, parent):
+        banner = tk.Frame(parent, bg='#132a1e', height=30)
+        banner.pack(fill='x'); banner.pack_propagate(False)
+        tk.Label(banner,
+                 text='🗒  PBR JSON BUILDER  —  two independent tools, side by side. '
+                      'Left: Python/keyword-driven scanner.  Right: PowerShell scaffold-then-fill workflow.  Drag divider to resize.',
+                 bg='#132a1e', fg=C['success'], font=('Segoe UI', 8, 'bold')
+                 ).pack(side='left', padx=14, pady=6)
+
+        body = tk.Frame(parent, bg=C['bg'])
+        body.pack(fill='both', expand=True)
+
+        pw = tk.PanedWindow(body, orient='horizontal', bg=C['border'], sashwidth=6, sashrelief='flat', handlepad=20, handlesize=8, showhandle=True)
+        pw.pack(fill='both', expand=True, padx=2, pady=2)
+
+        left_half = tk.Frame(pw, bg=C['bg'])
+        right_half = tk.Frame(pw, bg=C['bg'])
+        pw.add(left_half, minsize=380, width=700, stretch='always')
+        pw.add(right_half, minsize=380, width=700, stretch='always')
+
+        self._json_left_pane(left_half)
+        self._json_right_pane(right_half)
+
+    def _json_left_pane(self, parent):
+        left, log_w, pv = self._pbr_layout(parent, 'PYTHON  ·  KEYWORD-DRIVEN',
+            'Scans a mod folder for texture sets (needs at least diffuse + normal — '
+            'height/rmaos/glow/fuzz/subsurface/coat maps are all optional and '
+            'auto-detected) and writes a PBRNIFPatcher JSON. Extra config lives in '
+            'config.json (keyword + per-file overrides).')
         mod_var  = tk.StringVar(value=self.input_dir.get())
         name_var = tk.StringVar(value='my_mod_pbr')
         self._folder_row(left, 'Mod Folder', mod_var)
@@ -1545,73 +2380,83 @@ class TextureGeneratorApp:
                  ).pack(side='left', fill='x', expand=True, padx=4)
         self._sep(left)
         tk.Label(left, text='DEFAULT SETTINGS', bg=C['surface'], fg=C['accent'],
-                 font=('Segoe UI', 9,'bold')).pack(anchor='w', padx=16)
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=16)
+        tk.Label(left,
+                 text='emissive / parallax / subsurface / multilayer / fuzz are auto-'
+                      'detected per texture from _g/_p/_s/_cnr/_f maps — these sliders '
+                      'only set the static fallback values.',
+                 bg=C['surface'], fg=C['text_dim'], font=('Segoe UI', 7),
+                 wraplength=390, justify='left').pack(anchor='w', padx=16, pady=(0, 6))
         s_vars = {
-            'displacement_scale': self._slider_row(left, 'Displacement Scale', 0.0,2.0,0.05,0.4,18),
-            'specular_level':     self._slider_row(left, 'Specular Level',     0.0,1.0,0.01,0.02,18),
-            'roughness_scale':    self._slider_row(left, 'Roughness Scale',    0.0,2.0,0.05,1.0,18),
-            'smooth_angle':       self._slider_row(left, 'Smooth Angle',       0,180,1,75,18),
+            'specular_level':     self._slider_row(left, 'Specular Level',     0.0, 1.0, 0.01, 0.04, 18),
+            'roughness_scale':    self._slider_row(left, 'Roughness Scale',    0.0, 2.0, 0.05, 1.0,  18),
+            'subsurface_opacity': self._slider_row(left, 'Subsurface Opacity', 0.0, 1.0, 0.05, 1.0,  18),
+            'smooth_angle':       self._slider_row(left, 'Smooth Angle',       0, 180, 1, 75,         18),
         }
-        b_vars = {}
-        for key, lbl, dv in [('parallax','Enable Parallax',True),
-                              ('emissive','Enable Emissive',False),
-                              ('subsurface','Enable Subsurface',False)]:
-            v = tk.BooleanVar(value=dv)
-            ttk.Checkbutton(left, text=lbl, variable=v,
-                            style='Dark.TCheckbutton').pack(anchor='w', padx=16, pady=2)
-            b_vars[key] = v
         self._sep(left)
         def run():
-            cfg = {'defaults': {**{k: v.get() for k,v in s_vars.items()},
-                                **{k: v.get() for k,v in b_vars.items()}}}
+            cfg = {'defaults': {k: v.get() for k, v in s_vars.items()}}
             self._run_pbr_op(_pe.run_generate_json, log_w, pv,
                              mod_var.get(), name_var.get(),
                              config_override=cfg, done_msg='JSON generation complete.')
         self._mkbtn(left, '▶  Generate PBR JSON', run,
-                    pad=(16,10), font=('Segoe UI', 10,'bold')).pack(fill='x', padx=16, pady=6)
+                    pad=(16, 10), font=('Segoe UI', 10, 'bold')).pack(fill='x', padx=16, pady=6)
 
-    def _pbr_json_ps1_tab(self, parent):
-        left, log_w, pv = self._pbr_layout(parent, 'PBR JSON BUILDER (Step1/Step2)',
-            'Python port of the Step1.ps1 + Step2.ps1 pipeline: writes one JSON '
-            'per diffuse texture under <mod>/Textures/PBR, mirroring the folder '
-            'layout into <mod>/PBRNifPatcher. Only a diffuse image is required; '
-            'other maps are auto-detected from sibling files.')
+    def _json_right_pane(self, parent):
+        left, log_w, pv = self._pbr_layout(parent, 'POWERSHELL  ·  SCAFFOLD + FILL',
+            'Two-step workflow: Step 1 scaffolds a template JSON per diffuse texture '
+            'found under Textures\\PBR. Step 2 fills each one in from whichever '
+            '_d/_g/_f/_p/_s/_cnr maps actually sit next to it (and, if the JSON was '
+            'named "..._d", renames the diffuse file to drop that suffix).')
         mod_var = tk.StringVar(value=self.input_dir.get())
         self._folder_row(left, 'Mod Folder', mod_var)
-        tr = tk.Frame(left, bg=C['surface']); tr.pack(fill='x', padx=16, pady=3)
-        tk.Label(tr, text='Textures Subdir', bg=C['surface'], fg=C['text'],
-                 font=('Segoe UI', 8), width=13, anchor='w').pack(side='left')
-        tex_sub_var = tk.StringVar(value='Textures/PBR')
-        tk.Entry(tr, textvariable=tex_sub_var, bg=C['input'], fg=C['text'],
-                 insertbackground=C['text'], relief='flat', font=('Segoe UI', 8)
-                 ).pack(side='left', fill='x', expand=True, padx=4)
-        outr = tk.Frame(left, bg=C['surface']); outr.pack(fill='x', padx=16, pady=3)
-        tk.Label(outr, text='Output Subdir', bg=C['surface'], fg=C['text'],
-                 font=('Segoe UI', 8), width=13, anchor='w').pack(side='left')
-        out_sub_var = tk.StringVar(value='PBRNifPatcher')
-        tk.Entry(outr, textvariable=out_sub_var, bg=C['input'], fg=C['text'],
-                 insertbackground=C['text'], relief='flat', font=('Segoe UI', 8)
-                 ).pack(side='left', fill='x', expand=True, padx=4)
         self._sep(left)
-        tk.Label(left, text="Renames any '_d'-suffixed diffuse file on disk once "
-                 "its JSON is written (matches Step2.ps1's behavior).",
-                 bg=C['surface'], fg=C['text_dim'], font=('Segoe UI', 8),
-                 wraplength=390, justify='left').pack(anchor='w', padx=16, pady=(0,8))
-        def run():
-            self._run_pbr_op(_pe.run_generate_json_ps1_style, log_w, pv,
-                             mod_var.get(),
-                             textures_subdir=tex_sub_var.get(),
-                             output_subdir=out_sub_var.get(),
-                             done_msg='JSON generation complete.')
-        self._mkbtn(left, '▶  Generate PBR JSON (Step1/Step2)', run,
-                    pad=(16,10), font=('Segoe UI', 10,'bold')).pack(fill='x', padx=16, pady=6)
+        tk.Label(left, text='STEP 2 SETTINGS', bg=C['surface'], fg=C['accent'],
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=16)
+        s_vars = {
+            'SpecularLevel':      self._slider_row(left, 'Specular Level',      0.0, 1.0, 0.01,  0.04,  18),
+            'RoughnessScale':     self._slider_row(left, 'Roughness Scale',     0.0, 2.0, 0.05,  1.0,   18),
+            'SubsurfaceOpacity':  self._slider_row(left, 'Subsurface Opacity',  0.0, 1.0, 0.05,  1.0,   18),
+            'DisplacementScale':  self._slider_row(left, 'Displacement Scale',  0.0, 2.0, 0.05,  1.0,   18),
+            'MultilayerDisplacementScale':
+                                  self._slider_row(left, 'Multilayer Displacement', 0.0, 3.0, 0.05, 2.0, 18),
+            'CoatStrength':       self._slider_row(left, 'Coat Strength',       0.0, 1.0, 0.05,  1.0,   18),
+            'CoatRoughness':      self._slider_row(left, 'Coat Roughness',      0.0, 1.0, 0.05,  1.0,   18),
+            'CoatSpecularLevel':  self._slider_row(left, 'Coat Specular Level', 0.0, 0.2, 0.002, 0.018, 18),
+        }
+        self._sep(left)
+
+        def _step2_args():
+            args = ['-ModRoot', mod_var.get()]
+            for name, var in s_vars.items():
+                args += [f'-{name}', str(var.get())]
+            return args
+
+        def run_step1(on_complete=None):
+            self._run_ps_script('Step1.ps1', ['-ModRoot', mod_var.get()], log_w, pv,
+                                done_msg='Step 1 complete — stub JSONs scaffolded.',
+                                on_complete=on_complete)
+        def run_step2(on_complete=None):
+            self._run_ps_script('Step2.ps1', _step2_args(), log_w, pv,
+                                done_msg='Step 2 complete — JSONs filled in.',
+                                on_complete=on_complete)
+        def run_both():
+            run_step1(on_complete=lambda ok: run_step2() if ok else None)
+
+        self._mkbtn(left, '▶  Run Both Steps', run_both,
+                    pad=(16, 10), font=('Segoe UI', 10, 'bold')).pack(fill='x', padx=16, pady=(6, 3))
+        br = tk.Frame(left, bg=C['surface']); br.pack(fill='x', padx=16, pady=(0, 6))
+        self._mkbtn(br, 'Step 1 only', lambda: run_step1(), bg=C['panel2'], fg=C['text'],
+                    pad=(10, 6), font=('Segoe UI', 8)).pack(side='left', fill='x', expand=True, padx=(0, 4))
+        self._mkbtn(br, 'Step 2 only', lambda: run_step2(), bg=C['panel2'], fg=C['text'],
+                    pad=(10, 6), font=('Segoe UI', 8)).pack(side='left', fill='x', expand=True, padx=(4, 0))
 
     def _pbr_conv_to_pbr_tab(self, parent):
         left, log_w, pv = self._pbr_layout(parent, 'COMPLEX PARALLAX → CS PBR',
             'Convert Complex Parallax sets (_m) to Community Shaders PBR format.\n'
             'Needs: <name>.dds  +  <name>_n.dds  +  <name>_m.dds')
-        src_var = self.input_dir
-        out_var = self.output_dir
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(left, 'Source Folder', src_var)
         self._folder_row(left, 'Output Folder', out_var)
         self._sep(left)
@@ -1622,7 +2467,7 @@ class TextureGeneratorApp:
                  font=('Segoe UI', 8), justify='left').pack(anchor='w', padx=16, pady=4)
         self._sep(left)
         self._mkbtn(left, '▶  Convert to PBR',
-                    lambda: self._chk_tc() and self._run_pbr_op(
+                    lambda: self._need_texconv(log_w) and self._run_pbr_op(
                         _pe.run_convert_to_pbr, log_w, pv,
                         src_var.get(), out_var.get(),
                         done_msg='Complex → PBR complete.'),
@@ -1632,8 +2477,8 @@ class TextureGeneratorApp:
         left, log_w, pv = self._pbr_layout(parent, 'CS PBR → COMPLEX PARALLAX',
             'Convert CS PBR texture sets to Complex Parallax _m format.\n'
             'Needs: diffuse  +  _n normal  +  _p height  (optional: _rmaos)')
-        src_var = self.input_dir
-        out_var = self.output_dir
+        src_var = tk.StringVar(value=self.input_dir.get())
+        out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(left, 'Source Folder', src_var)
         self._folder_row(left, 'Output Folder', out_var)
         self._sep(left)
@@ -1646,7 +2491,7 @@ class TextureGeneratorApp:
                  font=('Segoe UI', 8), justify='left').pack(anchor='w', padx=16, pady=4)
         self._sep(left)
         self._mkbtn(left, '▶  Convert to Complex Parallax',
-                    lambda: self._chk_tc() and self._run_pbr_op(
+                    lambda: self._need_texconv(log_w) and self._run_pbr_op(
                         _pe.run_convert_to_complex, log_w, pv,
                         src_var.get(), out_var.get(),
                         done_msg='PBR → Complex complete.'),
@@ -1660,8 +2505,6 @@ class TextureGeneratorApp:
         self._mat_cells  = {}
         self._mat_photos = {}
         self._mat_paths  = {}
-        self._mat_enabled  = {}
-        self._mat_svars    = {}   # {map_name: {param: DoubleVar/BooleanVar}}
 
         # Left scrollable controls | Right preview grid
         left_outer = tk.Frame(parent, bg=C['surface'], width=490)
@@ -1691,44 +2534,18 @@ class TextureGeneratorApp:
             if f:
                 self._mat_src_var.set(os.path.normpath(f))
                 self._mat_load_preview()
-        tk.Button(src_r, text=' Browse… ', command=_pick,
-                  bg=C['accent'], fg='white',
-                  activebackground=C['accent_hi'], activeforeground='white',
-                  relief='flat', cursor='hand2', font=('Segoe UI', 8, 'bold'),
-                  padx=8, pady=4, bd=0).pack(side='right')
+        RoundedButton(src_r, text='Browse…', command=_pick,
+                      bg=C['accent'], fg='white', font=('Segoe UI', 8, 'bold'),
+                      pad=(10, 5)).pack(side='right')
 
         self._mkbtn(sf, '🖼  Load & Preview Source', self._mat_load_preview,
                     bg=C['panel'], fg=C['text'], pad=(16, 6),
                     font=('Segoe UI', 9)).pack(fill='x', padx=16, pady=4)
 
-        # ── Source adjustments (feeds into every derived map) ────────────────
-        self._sep(sf)
-        self._section_lbl(sf, 'SOURCE ADJUSTMENTS',
-            'Applied to the diffuse image before every map below is derived from it.')
-        self._mat_live_var = tk.BooleanVar(value=True)
-        live_row = tk.Frame(sf, bg=C['surface'])
-        live_row.pack(fill='x', padx=16, pady=(0, 4))
-        ttk.Checkbutton(live_row, text='Live preview (update thumbnails while dragging sliders)',
-                        variable=self._mat_live_var,
-                        style='Dark.TCheckbutton').pack(anchor='w')
-        diffuse_card = tk.Frame(sf, bg=C['panel'])
-        diffuse_card.pack(fill='x', padx=16, pady=3)
-        tk.Frame(diffuse_card, bg=C['panel'], height=4).pack()
-        self._mat_svars['diffuse'] = {}
-        for s_lbl, s_key, lo, hi, res, default in [
-            ('Brightness', 'brightness', -0.5, 0.5, 0.05, 0.0),
-            ('Contrast',   'contrast',    0.1, 3.0, 0.05, 1.0),
-            ('Saturation', 'saturation',  0.0, 2.0, 0.05, 1.0),
-        ]:
-            sv = self._mat_compact_slider(diffuse_card, s_lbl, lo, hi, res, default,
-                    on_change=lambda v: self._mat_schedule_live('diffuse'))
-            self._mat_svars['diffuse'][s_key] = sv
-        tk.Frame(diffuse_card, bg=C['panel'], height=5).pack()
-
         # ── Output ────────────────────────────────────────────────────────────
         self._sep(sf)
         self._section_lbl(sf, 'OUTPUT')
-        self._mat_out_var = self.output_dir
+        self._mat_out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(sf, 'Output Folder', self._mat_out_var)
 
         fmt_r = tk.Frame(sf, bg=C['surface'])
@@ -1744,6 +2561,9 @@ class TextureGeneratorApp:
         self._sep(sf)
         self._section_lbl(sf, 'MAP SETTINGS',
             'Enable / disable maps and adjust parameters.')
+
+        self._mat_enabled  = {}
+        self._mat_svars    = {}   # {map_name: {param: DoubleVar/BooleanVar}}
 
         map_defs = [
             ('height',    'HEIGHT',    '#4ec9b0',
@@ -1804,28 +2624,36 @@ class TextureGeneratorApp:
             en = tk.BooleanVar(value=True)
             self._mat_enabled[map_name] = en
             ttk.Checkbutton(hdr, text='', variable=en,
-                            style='Panel.TCheckbutton',
-                            command=lambda m=map_name: self._mat_schedule_live(m)
-                            ).pack(side='left')
+                            style='Panel.TCheckbutton').pack(side='left')
             tk.Label(hdr, text=label, bg=C['panel'], fg=col,
                      font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(2, 8))
             for tog_lbl, tog_key in toggles:
                 tv = tk.BooleanVar(value=False)
                 ttk.Checkbutton(hdr, text=tog_lbl, variable=tv,
-                                style='Panel.TCheckbutton',
-                                command=lambda m=map_name: self._mat_schedule_live(m)
-                                ).pack(side='right', padx=(4, 0))
+                                style='Panel.TCheckbutton').pack(side='right', padx=(4, 0))
                 self._mat_svars[map_name][tog_key] = tv
 
             # Sliders
             for s_lbl, s_key, lo, hi, res, default in sliders:
-                sv = self._mat_compact_slider(card, s_lbl, lo, hi, res, default,
-                        on_change=lambda v, m=map_name: self._mat_schedule_live(m))
+                sv = self._mat_compact_slider(card, s_lbl, lo, hi, res, default)
                 self._mat_svars[map_name][s_key] = sv
 
             tk.Frame(card, bg=C['panel'], height=5).pack()
 
         # ── RMAOS packer ─────────────────────────────────────────────────────────
+        # ── Generate ──────────────────────────────────────────────────────────
+        self._sep(sf)
+        self._mkbtn(sf, '▶  Generate All Maps', self._mat_generate,
+                    pad=(16, 12), font=('Segoe UI', 11, 'bold')
+                    ).pack(fill='x', padx=16, pady=6)
+
+        self._mat_prog = tk.DoubleVar(value=0)
+        ttk.Progressbar(sf, variable=self._mat_prog, maximum=100
+                        ).pack(fill='x', padx=16, pady=(0, 4))
+        self._mat_status = tk.Label(sf, text='Ready.', bg=C['surface'],
+                                     fg=C['text_dim'], font=('Segoe UI', 8),
+                                     wraplength=430, justify='left')
+        self._mat_status.pack(anchor='w', padx=16, pady=(0, 14))
         self._sep(sf)
         self._section_lbl(sf, 'RMAOS CHANNEL PACKER',
             'Pack generated maps into a single combined RMAOS texture.\n'
@@ -1891,24 +2719,11 @@ class TextureGeneratorApp:
                  bg=C['panel'], fg=C['text_dim'],
                  font=('Segoe UI', 8), justify='left').pack(anchor='w', padx=10, pady=(8,4))
         self._mkbtn(prev_card, '🔭  Open Material Preview',
-                    self._open_material_preview,
+                    lambda: self._open_material_preview(source='material_generator'),
                     bg='#1a3a2a', fg=C['success'],
                     pad=(14, 10), font=('Segoe UI', 10, 'bold')
                     ).pack(fill='x', padx=10, pady=(0, 10))
 
-        # ── Generate ──────────────────────────────────────────────────────────
-        self._sep(sf)
-        self._mkbtn(sf, '▶  Generate All Maps', self._mat_generate,
-                    pad=(16, 12), font=('Segoe UI', 11, 'bold')
-                    ).pack(fill='x', padx=16, pady=6)
-
-        self._mat_prog = tk.DoubleVar(value=0)
-        ttk.Progressbar(sf, variable=self._mat_prog, maximum=100
-                        ).pack(fill='x', padx=16, pady=(0, 4))
-        self._mat_status = tk.Label(sf, text='Ready.', bg=C['surface'],
-                                     fg=C['text_dim'], font=('Segoe UI', 8),
-                                     wraplength=430, justify='left')
-        self._mat_status.pack(anchor='w', padx=16, pady=(0, 14))
 
         # ── Right: 2-column preview grid ──────────────────────────────────────
         rc = tk.Canvas(right, bg=C['bg'], highlightthickness=0)
@@ -1918,9 +2733,9 @@ class TextureGeneratorApp:
         gw = rc.create_window((0, 0), window=gf, anchor='nw')
         rc.configure(yscrollcommand=rsb.set)
         rc.bind('<Configure>', lambda e, w=gw: rc.itemconfig(w, width=e.width))
-        rc.bind_all('<MouseWheel>', lambda e: rc.yview_scroll(-1*(e.delta//120), 'units'))
         rc.pack(side='left', fill='both', expand=True)
         rsb.pack(side='right', fill='y')
+        self._bind_wheel_scroll(rc, gf)
 
         gf.columnconfigure(0, weight=1, uniform='mc')
         gf.columnconfigure(1, weight=1, uniform='mc')
@@ -1975,9 +2790,8 @@ class TextureGeneratorApp:
                 'canvas': cv, 'save_btn': sb, 'status': sl, 'size': THUMB}
 
     # ── Material helper widgets ───────────────────────────────────────────────
-    def _mat_compact_slider(self, parent, label, lo, hi, res, default, on_change=None):
-        """One compact label+scale+value row inside a map settings card.
-        on_change(value), if given, fires (debounced upstream) on every drag tick."""
+    def _mat_compact_slider(self, parent, label, lo, hi, res, default):
+        """One compact label+scale+value row inside a map settings card."""
         var = tk.DoubleVar(value=default)
         row = tk.Frame(parent, bg=C['panel'])
         row.pack(fill='x', padx=8, pady=1)
@@ -1986,15 +2800,11 @@ class TextureGeneratorApp:
         val_lbl = tk.Label(row, text=f'{default:.2f}', bg=C['panel'],
                            fg=C['text_bright'], font=('Consolas', 7), width=6)
         val_lbl.pack(side='right')
-        def _on_move(v):
-            val_lbl.config(text=f'{float(v):.2f}')
-            if on_change:
-                on_change(v)
         tk.Scale(row, from_=lo, to=hi, resolution=res, orient='horizontal',
-                 variable=var, bg=C['panel'], fg=C['text'],
-                 troughcolor=C['input'], highlightthickness=0,
-                 showvalue=False, sliderlength=12,
-                 command=_on_move
+                 variable=var, bg=C['accent'], fg=C['text'],
+                 troughcolor=C['input'], highlightthickness=0, activebackground=C['accent_hi'],
+                 showvalue=False, sliderlength=12, sliderrelief='raised', bd=1,
+                 command=lambda v, l=val_lbl: l.config(text=f'{float(v):.2f}')
                  ).pack(fill='x', expand=True, padx=(2, 4))
         return var
 
@@ -2009,124 +2819,6 @@ class TextureGeneratorApp:
         name = os.path.basename(src)
         self._mat_status.config(text=f'Loaded: {name}')
         self.root.after(0, lambda: self._mat_prog.set(0))
-
-        # Cache a small BGR array for fast, in-memory live-preview regeneration
-        # (full-res generation still only happens on "Generate All Maps").
-        try:
-            arr = _me._load(src) if _MAT_OK else None
-            if arr is not None:
-                h, w = arr.shape[:2]
-                max_dim = 256
-                if max(h, w) > max_dim:
-                    scale = max_dim / max(h, w)
-                    arr = cv2.resize(arr, (max(1, int(w*scale)), max(1, int(h*scale))),
-                                     interpolation=cv2.INTER_AREA)
-                self._mat_preview_src = arr
-                self._mat_live_pending = set()
-                self._mat_schedule_live('diffuse')
-        except Exception as e:
-            self._mat_preview_src = None
-            print(f'[Material Preview] Could not cache live-preview source: {e}')
-
-    # ── Live preview (in-memory, low-res, no disk I/O) ────────────────────────
-    _MAT_DEPENDENTS = {
-        'diffuse':   ('height', 'normal', 'ao', 'roughness', 'metalness', 'edge', 'emissive'),
-        'height':    ('height', 'normal', 'ao'),
-        'normal':    ('normal', 'ao'),
-        'ao':        ('ao',),
-        'roughness': ('roughness',),
-        'metalness': ('metalness',),
-        'edge':      ('edge',),
-        'emissive':  ('emissive',),
-    }
-
-    def _mat_schedule_live(self, changed_map):
-        """Debounced entry point -- called on every slider tick / toggle
-        click. Coalesces rapid-fire calls into one regen ~100ms after the
-        user stops moving, so dragging stays smooth."""
-        if not _MAT_OK or not getattr(self, '_mat_live_var', None) or not self._mat_live_var.get():
-            return
-        if getattr(self, '_mat_preview_src', None) is None:
-            return
-        pending = getattr(self, '_mat_live_pending', None)
-        if pending is None:
-            pending = set()
-            self._mat_live_pending = pending
-        pending.update(self._MAT_DEPENDENTS.get(changed_map, (changed_map,)))
-
-        if getattr(self, '_mat_live_after_id', None):
-            try: self.root.after_cancel(self._mat_live_after_id)
-            except Exception: pass
-        self._mat_live_after_id = self.root.after(100, self._mat_regen_live)
-
-    def _mat_regen_live(self):
-        """Recompute only the maps queued in _mat_live_pending, from the
-        cached low-res source, and update their thumbnails in place."""
-        self._mat_live_after_id = None
-        maps_to_run = getattr(self, '_mat_live_pending', set())
-        self._mat_live_pending = set()
-        if not maps_to_run:
-            return
-        base = self._mat_preview_src
-        if base is None:
-            return
-
-        try:
-            diffuse_kw = {k: v.get() for k, v in self._mat_svars.get('diffuse', {}).items()}
-            img = _me.adjust_diffuse(base, **diffuse_kw) if diffuse_kw else base
-
-            height_map = None
-            normal_map = None
-            # Compute height first if anything downstream needs it
-            if any(m in ('height', 'normal', 'ao') for m in maps_to_run):
-                h_kw = {k: v.get() for k, v in self._mat_svars.get('height', {}).items()}
-                height_map = _me.height_from_diffuse(img, **h_kw)
-            # AO's blend needs a normal map too, even if 'normal' itself isn't queued
-            if 'ao' in maps_to_run:
-                n_kw = {k: v.get() for k, v in self._mat_svars.get('normal', {}).items()}
-                normal_map = _me.normal_from_height_and_diffuse(height_map, img, **n_kw)
-
-            for map_name in maps_to_run:
-                if not self._mat_enabled.get(map_name, tk.BooleanVar(value=True)).get():
-                    continue
-                kw = {k: v.get() for k, v in self._mat_svars.get(map_name, {}).items()}
-                try:
-                    if map_name == 'height':
-                        result = height_map if height_map is not None else _me.height_from_diffuse(img, **kw)
-                    elif map_name == 'normal':
-                        result = _me.compute_map(map_name, img, kw, height_map=height_map)
-                        normal_map = result
-                    else:
-                        result = _me.compute_map(map_name, img, kw, height_map=height_map, normal_map=normal_map)
-                    self._mat_update_cell_from_array(map_name, result)
-                except Exception as e:
-                    print(f'[Material Preview] live regen failed for {map_name}: {e}')
-        except Exception as e:
-            print(f'[Material Preview] live regen error: {e}')
-
-    def _mat_update_cell_from_array(self, map_name, arr):
-        """Same as _mat_update_cell, but from an in-memory numpy array
-        (BGR or grayscale) instead of a file path -- used for live preview
-        so nothing touches disk while dragging sliders."""
-        if map_name not in self._mat_cells:
-            return
-        info = self._mat_cells[map_name]
-        cv_widget, size = info['canvas'], info['size']
-        try:
-            if arr.ndim == 2:
-                pil = Image.fromarray(arr)
-            elif arr.shape[2] == 3:
-                pil = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
-            else:
-                pil = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGRA2RGBA))
-            pil.thumbnail((size, size), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(pil)
-            self._mat_photos[map_name] = photo  # prevent GC
-            cv_widget.delete('all')
-            cv_widget.create_image(size // 2, size // 2, anchor='center', image=photo)
-            info['status'].config(text='(live preview)', fg=C['text_dim'])
-        except Exception as e:
-            print(f'[Material Preview] could not display live {map_name}: {e}')
 
     def _mat_update_cell(self, map_name, img_path):
         """Load image, thumbnail it, display in the named preview cell."""
@@ -2198,22 +2890,73 @@ class TextureGeneratorApp:
             shutil.copy2(src, dst)
             self._mat_status.config(text=f'Saved: {os.path.basename(dst)}')
 
-    def _open_material_preview(self):
-        """Open (or focus) the 3D material preview window."""
+    def _open_material_preview(self, source='material_generator'):
+        """Open (or focus) the 3D material preview window, loaded with maps
+        from whichever tab asked for it (source='material_generator' or
+        'dual_layer')."""
         global _preview_win
         if not _MP_OK:
             messagebox.showerror('Missing Module',
-                'material_preview.py not found alongside the executable.')
+                f'material_preview.py failed to load:\n{_MP_ERR}')
             return
+        source_changed = getattr(self, '_preview_source', None) != source
+        self._preview_source = source
         if _preview_win is None or not (_preview_win.win and
                                          _preview_win.win.winfo_exists()):
             _preview_win = _mp.MaterialPreviewWindow(self)
+        elif source_changed:
+            # Same window, different tab's maps — force a reload on next render.
+            _preview_win._maps_dirty = True
+            _preview_win._queue_render()
         _preview_win.open()
+
+    def get_preview_maps(self):
+        """Returns {texture_key: source} for whichever tab last opened the
+        material preview. source can be a file path or a PIL Image — both
+        are accepted by the renderer's load_texture()."""
+        if getattr(self, '_preview_source', 'material_generator') == 'dual_layer':
+            maps = {}
+            if 'basecolor' in self._dl_maps:
+                maps['albedo'] = self._dl_maps['basecolor']
+            if 'normal' in self._dl_maps:
+                maps['normal'] = self._dl_maps['normal']
+            if 'height' in self._dl_maps:
+                maps['height'] = self._dl_maps['height']
+            if 'roughness' in self._dl_maps or 'metallic' in self._dl_maps:
+                rmaos = self._dl_pack_rmaos_preview()
+                if rmaos is not None:
+                    maps['rmaos'] = rmaos
+            return maps
+        # Material Generator — file paths on disk
+        MAP = {'diffuse': 'albedo', 'normal': 'normal', 'height': 'height', 'rmaos': 'rmaos'}
+        out = {}
+        for mat_key, tex_key in MAP.items():
+            path = self._mat_paths.get(mat_key, '')
+            if path and os.path.isfile(path):
+                out[tex_key] = path
+        return out
+
+    def _dl_pack_rmaos_preview(self):
+        """Dual Layer Builder keeps roughness/metallic as separate in-memory
+        images with no packed AO/specular channel — build a throwaway RMAOS
+        (R=roughness, G=metalness, B=AO(=white), A=specular(=white)) just for
+        the preview, without touching Dual Layer's own save/export flow."""
+        rough = self._dl_maps.get('roughness')
+        metal = self._dl_maps.get('metallic')
+        base = rough or metal
+        if base is None:
+            return None
+        size = base.size
+        r = (rough.convert('L').resize(size) if rough else Image.new('L', size, 128))
+        g = (metal.convert('L').resize(size) if metal else Image.new('L', size, 0))
+        b = Image.new('L', size, 255)  # AO — Dual Layer doesn't compute one
+        a = Image.new('L', size, 255)  # specular/smoothness — no source map
+        return Image.merge('RGBA', (r, g, b, a))
 
     def _mat_pack_rmaos(self):
         """Pack generated maps into RMAOS right now using current channel settings."""
         if not _MAT_OK:
-            messagebox.showerror('Missing Module', 'material_engine.py not found.')
+            messagebox.showerror('Missing Module', f'material_engine.py failed to load:\n{_MAT_ERR}')
             return
         out = self._mat_out_var.get().strip()
         if not out:
@@ -2274,7 +3017,7 @@ class TextureGeneratorApp:
         """Build settings dict and run generate_all_maps in a background thread."""
         if not _MAT_OK:
             messagebox.showerror('Missing Module',
-                                 'material_engine.py not found alongside the exe.')
+                                 f'material_engine.py failed to load:\n{_MAT_ERR}')
             return
 
         src = self._mat_src_var.get().strip()
@@ -2287,11 +3030,9 @@ class TextureGeneratorApp:
             return
 
         # Build settings dict from current UI vars
-        settings = {'enabled': {}, 'diffuse': {}, 'height': {}, 'normal': {}, 'ao': {},
+        settings = {'enabled': {}, 'height': {}, 'normal': {}, 'ao': {},
                     'roughness': {}, 'metalness': {}, 'edge': {}, 'emissive': {},
                     'rmaos': {}}
-
-        settings['diffuse'] = {k: v.get() for k, v in self._mat_svars.get('diffuse', {}).items()}
 
         for map_name in _me.MAP_ORDER:
             settings['enabled'][map_name] = self._mat_enabled.get(map_name,
@@ -2340,168 +3081,229 @@ class TextureGeneratorApp:
     # DUAL LAYER MATERIAL BUILDER
     # =========================================================================
     def _build_dual_layer_tab(self, parent):
-        """8-map dual-layer material generator from a single diffuse image."""
+        """v1.4 - Maps on top (big + responsive), controls on bottom in columns."""
         self._dl_src    = None
         self._dl_maps   = {}
         self._dl_photos = {}
+        self._dl_live_enabled = tk.BooleanVar(value=True)
+        self._dl_live_job = None
+        self._dl_thumb_size = 260
 
-        left = tk.Frame(parent, bg=C['surface'], width=320)
-        left.pack(side='left', fill='y')
-        left.pack_propagate(False)
-        right = tk.Frame(parent, bg=C['bg'])
-        right.pack(side='right', fill='both', expand=True)
+        # Main vertical split: top = previews (expandable), bottom = controls
+        main = tk.Frame(parent, bg=C['bg'])
+        main.pack(fill='both', expand=True)
 
-        # ── Left controls ────────────────────────────────────────────────────
-        _, sf = self._make_scrollable(left, C['surface'])
+        top = tk.Frame(main, bg=C['bg'])
+        top.pack(side='top', fill='both', expand=True, padx=2, pady=2)
 
-        self._section_lbl(sf, 'DUAL LAYER MATERIAL BUILDER',
-            'Generate 8 PBR maps (BaseColor, Normal, Roughness, Metallic, Height, '
-            'CoatColor, CoatNormal, CoatRoughness) from a single diffuse image.')
+        bottom = tk.Frame(main, bg=C['surface'], height=420)
+        bottom.pack(side='bottom', fill='x')
+        bottom.pack_propagate(False)
 
-        # Source picker
-        src_row = tk.Frame(sf, bg=C['surface'])
-        src_row.pack(fill='x', padx=16, pady=4)
-        self._dl_src_lbl = tk.Label(src_row, text='No image loaded',
+        # Bottom controls - scrollable vertically (since many sliders)
+        bot_canvas, sf = self._make_scrollable(bottom, C['surface'])
+
+        # Top bar inside bottom for Load + Live toggle + Actions
+        top_ctrl = tk.Frame(sf, bg=C['surface'])
+        top_ctrl.pack(fill='x', padx=12, pady=8)
+
+        self._dl_src_lbl = tk.Label(top_ctrl, text='No image loaded',
                                      bg=C['surface'], fg=C['text_dim'],
-                                     font=('Segoe UI', 8), wraplength=240, anchor='w')
-        self._dl_src_lbl.pack(side='left', fill='x', expand=True)
+                                     font=('Segoe UI', 9), wraplength=400, anchor='w')
+        self._dl_src_lbl.pack(side='left', fill='x', expand=True, padx=(0,10))
 
         def _pick_src():
             f = filedialog.askopenfilename(
                 title='Select diffuse image',
-                filetypes=[('Images','*.png *.jpg *.jpeg *.bmp *.tga *.dds'),
-                           ('All','*.*')])
+                filetypes=[('Images','*.png *.jpg *.jpeg *.bmp *.tga *.dds'),('All','*.*')])
             if not f: return
             try:
                 self._dl_src = Image.open(f).convert('RGB')
                 self._dl_src_lbl.config(text=os.path.basename(f), fg=C['text'])
                 self._dl_btn_gen.config(state='normal')
                 self._dl_update_cell('basecolor', self._dl_src)
+                if self._dl_live_enabled.get():
+                    self._dl_schedule_live()
             except Exception as e:
                 messagebox.showerror('Load Error', str(e))
 
-        self._mkbtn(sf, '📁  Load Diffuse Image', _pick_src,
-                    pad=(16,8), font=('Segoe UI', 9, 'bold')
-                    ).pack(fill='x', padx=16, pady=(2,8))
+        self._mkbtn(top_ctrl, 'Load Diffuse', _pick_src, pad=(14,8), font=('Segoe UI', 9, 'bold')).pack(side='left', padx=4)
+        ttk.Checkbutton(top_ctrl, text='Live Preview', variable=self._dl_live_enabled, style='Dark.TCheckbutton').pack(side='left', padx=12)
 
-        self._sep(sf)
-        self._section_lbl(sf, 'MATERIAL SETTINGS')
+        # Controls columns frame
+        cols_frame = tk.Frame(sf, bg=C['surface'])
+        cols_frame.pack(fill='x', padx=8, pady=4)
+        for i in range(4):
+            cols_frame.columnconfigure(i, weight=1, uniform='ctrlcol')
 
-        # Sliders
+        col_frames = []
+        for i in range(4):
+            cf = tk.Frame(cols_frame, bg=C['surface'], highlightbackground=C['border'], highlightthickness=0)
+            cf.grid(row=0, column=i, sticky='nsew', padx=6, pady=2)
+            col_frames.append(cf)
+
+        # Vars
         self._dl_vars = {}
-        def _sl(lbl, lo, hi, default, key):
-            var = self._mat_compact_slider(sf, lbl, lo, hi,
-                                           round((hi-lo)/100, 4), default)
+        def _sl(parent_frame, lbl, lo, hi, default, key):
+            var = self._mat_compact_slider(parent_frame, lbl, lo, hi, round((hi-lo)/100, 4) if hi-lo>1 else 0.01, default)
             self._dl_vars[key] = var
+            def _on_change(*_args):
+                if self._dl_live_enabled.get() and self._dl_src is not None:
+                    self._dl_schedule_live()
+            var.trace_add('write', _on_change)
             return var
 
-        _sl('Normal Strength',   0.1, 10.0, 3.0,  'normal_strength')
-        _sl('Roughness Contrast',0.5,  3.0, 1.0,  'rough_contrast')
+        # COL 0 - Base + Normal
+        self._section_lbl(col_frames[0], 'BASE COLOR')
+        _sl(col_frames[0], 'BC Bright',  -0.5, 0.5, 0.0, 'base_brightness')
+        _sl(col_frames[0], 'BC Contrast', 0.5, 2.0, 1.0, 'base_contrast')
+        _sl(col_frames[0], 'BC Saturat',  0.0, 2.0, 1.0, 'base_saturation')
+        self._sep(col_frames[0])
+        self._section_lbl(col_frames[0], 'NORMAL MAP')
+        _sl(col_frames[0], 'Norm Str', 0.1, 10.0, 3.0, 'normal_strength')
+        _sl(col_frames[0], 'Norm Blur', 0.0, 10.0, 0.0, 'normal_blur')
+        _sl(col_frames[0], 'Norm Z', 0.1, 5.0, 1.0, 'normal_z')
+        _sl(col_frames[0], 'Norm Det', 0.0, 1.0, 0.2, 'normal_detail')
+        self._dl_flip_x = tk.BooleanVar(value=False)
+        self._dl_flip_y = tk.BooleanVar(value=False)
+        self._dl_normal_mode = tk.StringVar(value='Sobel')
+        fr = tk.Frame(col_frames[0], bg=C['surface']); fr.pack(fill='x', pady=2)
+        cbx = ttk.Checkbutton(fr, text='Flip X', variable=self._dl_flip_x, style='Dark.TCheckbutton')
+        cbx.pack(side='left'); cbx.config(command=lambda: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        cby = ttk.Checkbutton(fr, text='Flip Y', variable=self._dl_flip_y, style='Dark.TCheckbutton')
+        cby.pack(side='left', padx=(8,0)); cby.config(command=lambda: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        fr2 = tk.Frame(col_frames[0], bg=C['surface']); fr2.pack(fill='x', pady=2)
+        tk.Label(fr2, text='Mode:', bg=C['surface'], fg=C['text'], font=('Segoe UI', 8)).pack(side='left')
+        cmb_nm = ttk.Combobox(fr2, textvariable=self._dl_normal_mode, values=['Sobel','Scharr'], width=8, state='readonly')
+        cmb_nm.pack(side='left', padx=4); cmb_nm.bind('<<ComboboxSelected>>', lambda e: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
 
+        # COL 1 - Roughness + Metallic
+        self._section_lbl(col_frames[1], 'ROUGHNESS')
+        _sl(col_frames[1], 'Rough Contr', 0.5, 3.0, 1.0, 'rough_contrast')
+        _sl(col_frames[1], 'Rough Min', 0.0, 1.0, 0.0, 'rough_min')
+        _sl(col_frames[1], 'Rough Max', 0.0, 1.0, 1.0, 'rough_max')
+        _sl(col_frames[1], 'Rough Gamma', 0.1, 3.0, 1.0, 'rough_gamma')
+        _sl(col_frames[1], 'Rough Blur', 0.0, 10.0, 0.0, 'rough_blur')
+        _sl(col_frames[1], 'Rough AO', 0.0, 1.0, 0.0, 'rough_ao_mix')
         self._dl_rough_inv = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sf, text='Invert Roughness',
-                        variable=self._dl_rough_inv,
-                        style='Dark.TCheckbutton').pack(anchor='w', padx=16, pady=2)
+        rcb = ttk.Checkbutton(col_frames[1], text='Invert Roughness', variable=self._dl_rough_inv, style='Dark.TCheckbutton')
+        rcb.pack(anchor='w', pady=2); rcb.config(command=lambda: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        self._sep(col_frames[1])
+        self._section_lbl(col_frames[1], 'METALLIC - UPGRADED')
+        self._dl_metal_mode = tk.StringVar(value='Flat')
+        fr3 = tk.Frame(col_frames[1], bg=C['surface']); fr3.pack(fill='x', pady=2)
+        tk.Label(fr3, text='Mode:', bg=C['surface'], fg=C['text'], font=('Segoe UI', 8)).pack(side='left')
+        cmb_mm = ttk.Combobox(fr3, textvariable=self._dl_metal_mode, values=['Flat','Threshold','Color Detect'], width=12, state='readonly')
+        cmb_mm.pack(side='left', padx=4); cmb_mm.bind('<<ComboboxSelected>>', lambda e: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        _sl(col_frames[1], 'Metal Level', 0.0, 1.0, 0.0, 'metallic')
+        _sl(col_frames[1], 'Metal Thresh', 0.0, 1.0, 0.6, 'metal_thresh')
+        _sl(col_frames[1], 'Metal Toler', 0.0, 0.5, 0.1, 'metal_toler')
+        _sl(col_frames[1], 'Metal Contr', 0.5, 3.0, 1.0, 'metal_contrast')
+        _sl(col_frames[1], 'Metal Blur', 0.0, 10.0, 0.0, 'metal_blur')
 
-        _sl('Metallic Level',    0.0,  1.0, 0.0,  'metallic')
-        _sl('Parallax Scale',    0.0,  0.1, 0.05, 'parallax')
-
+        # COL 2 - Height / AO
+        self._section_lbl(col_frames[2], 'HEIGHT / PARALLAX')
+        self._dl_height_src = tk.StringVar(value='Luminance')
+        fr4 = tk.Frame(col_frames[2], bg=C['surface']); fr4.pack(fill='x', pady=2)
+        tk.Label(fr4, text='Source:', bg=C['surface'], fg=C['text'], font=('Segoe UI', 8)).pack(side='left')
+        cmb_hs = ttk.Combobox(fr4, textvariable=self._dl_height_src, values=['Luminance','Red Channel','Average'], width=12, state='readonly')
+        cmb_hs.pack(side='left', padx=4); cmb_hs.bind('<<ComboboxSelected>>', lambda e: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        _sl(col_frames[2], 'Height Contr', 0.5, 3.0, 1.0, 'height_contrast')
+        _sl(col_frames[2], 'Height Bright', -1.0, 1.0, 0.0, 'height_brightness')
+        _sl(col_frames[2], 'Height Blur', 0.0, 10.0, 0.0, 'height_blur')
+        _sl(col_frames[2], 'Height Mid', 0.0, 1.0, 0.5, 'height_midlevel')
+        _sl(col_frames[2], 'Parallax', 0.0, 0.1, 0.05, 'parallax')
         self._dl_height_inv = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sf, text='Invert Height',
-                        variable=self._dl_height_inv,
-                        style='Dark.TCheckbutton').pack(anchor='w', padx=16, pady=2)
+        hcb = ttk.Checkbutton(col_frames[2], text='Invert Height', variable=self._dl_height_inv, style='Dark.TCheckbutton')
+        hcb.pack(anchor='w', pady=2); hcb.config(command=lambda: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        self._sep(col_frames[2])
+        self._section_lbl(col_frames[2], 'AO / CURVATURE')
+        _sl(col_frames[2], 'AO Strength', 0.0, 2.0, 1.0, 'ao_strength')
+        _sl(col_frames[2], 'AO Radius', 0.0, 10.0, 3.0, 'ao_radius')
 
-        self._sep(sf)
-        self._section_lbl(sf, 'CLEAR COAT')
-
-        _sl('Coat Opacity',   0.0, 1.0, 0.0,  'coat_opacity')
-        _sl('Coat Roughness', 0.0, 1.0, 0.2,  'coat_roughness')
-
+        # COL 3 - Clear Coat + Actions
+        self._section_lbl(col_frames[3], 'CLEAR COAT')
+        _sl(col_frames[3], 'Coat Opacity', 0.0, 1.0, 0.0, 'coat_opacity')
+        _sl(col_frames[3], 'Coat Rough', 0.0, 1.0, 0.2, 'coat_roughness')
+        _sl(col_frames[3], 'Coat Norm', 0.0, 2.0, 1.0, 'coat_normal_str')
+        _sl(col_frames[3], 'Coat Metal', 0.0, 1.0, 0.0, 'coat_metallic')
+        _sl(col_frames[3], 'Coat Parallax', 0.0, 0.1, 0.02, 'coat_parallax')
         self._dl_coat_color = '#ffffff'
-        cc_row = tk.Frame(sf, bg=C['surface'])
-        cc_row.pack(fill='x', padx=16, pady=4)
-        tk.Label(cc_row, text='Coat Color', bg=C['surface'], fg=C['text'],
-                 font=('Segoe UI', 8), width=14, anchor='w').pack(side='left')
-        self._dl_cc_btn = tk.Button(cc_row, text='  ■  #ffffff  ',
-                                     bg='#ffffff', fg='#111',
-                                     relief='flat', cursor='hand2',
-                                     font=('Segoe UI', 8),
-                                     command=self._dl_pick_coat_color)
+        cc_row = tk.Frame(col_frames[3], bg=C['surface']); cc_row.pack(fill='x', pady=4)
+        tk.Label(cc_row, text='Coat Color', bg=C['surface'], fg=C['text'], font=('Segoe UI', 8), width=10, anchor='w').pack(side='left')
+        self._dl_cc_btn = RoundedButton(cc_row, text='#ffffff', bg='#ffffff', fg='#111111', font=('Segoe UI', 8), pad=(10, 5), command=self._dl_pick_coat_color)
         self._dl_cc_btn.pack(side='left', padx=4)
-
         self._dl_use_coat_normal = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sf, text='Use blurred normal as coat normal',
-                        variable=self._dl_use_coat_normal,
-                        style='Dark.TCheckbutton').pack(anchor='w', padx=16, pady=4)
-
-        self._sep(sf)
-
-        self._dl_btn_gen = self._mkbtn(
-            sf, '⚡  Generate All 8 Maps', self._dl_generate,
-            pad=(16,12), font=('Segoe UI', 11, 'bold'))
-        self._dl_btn_gen.pack(fill='x', padx=16, pady=4)
-        self._dl_btn_gen.config(state='disabled')
-
+        ucc = ttk.Checkbutton(col_frames[3], text='Use blurred normal as coat normal', variable=self._dl_use_coat_normal, style='Dark.TCheckbutton')
+        ucc.pack(anchor='w', pady=2); ucc.config(command=lambda: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        self._sep(col_frames[3])
+        self._dl_btn_gen = self._mkbtn(col_frames[3], 'Generate All 8 Maps', self._dl_generate, pad=(12,10), font=('Segoe UI', 10, 'bold'))
+        self._dl_btn_gen.pack(fill='x', pady=4); self._dl_btn_gen.config(state='disabled')
         self._dl_prog = tk.DoubleVar(value=0)
-        ttk.Progressbar(sf, variable=self._dl_prog, maximum=100
-                        ).pack(fill='x', padx=16, pady=(0,4))
+        ttk.Progressbar(col_frames[3], variable=self._dl_prog, maximum=100).pack(fill='x', pady=4)
+        self._mkbtn(col_frames[3], 'Save All Maps', self._dl_save_all, bg=C['panel2'], fg=C['text'], pad=(12,8)).pack(fill='x', pady=4)
+        self._mkbtn(col_frames[3], 'Open Material Preview', lambda: self._open_material_preview(source='dual_layer'), bg='#1a3a2a', fg=C['success'], pad=(12, 8), font=('Segoe UI', 9, 'bold')).pack(fill='x', pady=6)
 
-        self._mkbtn(sf, '💾  Save All Maps', self._dl_save_all,
-                    bg=C['panel'], fg=C['text'], pad=(16,8),
-                    font=('Segoe UI', 9)).pack(fill='x', padx=16, pady=(0,14))
-
-        # ── Right: 4×2 preview grid ───────────────────────────────────────────
-        rc = tk.Canvas(right, bg=C['bg'], highlightthickness=0)
-        rsb = ttk.Scrollbar(right, orient='vertical', command=rc.yview)
+        # --- TOP PREVIEWS - BIG + RESPONSIVE ---
+        # Canvas for previews that resizes
+        rc = tk.Canvas(top, bg=C['bg'], highlightthickness=0)
+        rsb = ttk.Scrollbar(top, orient='vertical', command=rc.yview)
         gf = tk.Frame(rc, bg=C['bg'])
         gf.bind('<Configure>', lambda e: rc.configure(scrollregion=rc.bbox('all')))
         gw = rc.create_window((0,0), window=gf, anchor='nw')
         rc.configure(yscrollcommand=rsb.set)
-        rc.bind('<Configure>', lambda e: rc.itemconfig(gw, width=e.width))
+        def _on_rc_resize(e):
+            rc.itemconfig(gw, width=e.width)
+            # Responsive thumb calc: 4 cols, with padding
+            avail = max(800, e.width - 40)
+            new_thumb = max(200, min(450, (avail // 4) - 24))
+            if abs(new_thumb - self._dl_thumb_size) > 15:
+                self._dl_thumb_size = new_thumb
+                for info in getattr(self, '_dl_cells', {}).values():
+                    info['canvas'].config(width=new_thumb, height=new_thumb)
+                    info['size'] = new_thumb
+                # Re-render existing maps at new size
+                for k, im in self._dl_maps.items():
+                    if k in self._dl_cells:
+                        self._dl_update_cell(k, im)
+        rc.bind('<Configure>', _on_rc_resize)
         rc.pack(side='left', fill='both', expand=True)
         rsb.pack(side='right', fill='y')
-
+        self._bind_wheel_scroll(rc, gf)
         for c in range(4):
             gf.columnconfigure(c, weight=1, uniform='dlc')
-
-        THUMB = 170
-        CELLS = [
-            ('basecolor',     'BASE COLOR',    C['accent'],   0, 0),
-            ('normal',        'NORMAL',        '#569cd6',     0, 1),
-            ('roughness',     'ROUGHNESS',     '#ce9178',     0, 2),
-            ('metallic',      'METALLIC',      '#dcdcaa',     0, 3),
-            ('height',        'HEIGHT',        '#4ec9b0',     1, 0),
-            ('coatcolor',     'COAT COLOR',    '#c586c0',     1, 1),
-            ('coatnormal',    'COAT NORMAL',   '#9cdcfe',     1, 2),
-            ('coatroughness', 'COAT ROUGHNESS','#ff8c00',     1, 3),
-        ]
         self._dl_cells = {}
-        for key, disp, col, row, colnum in CELLS:
-            cell = tk.Frame(gf, bg=C['panel'])
-            cell.grid(row=row, column=colnum, padx=5, pady=5, sticky='nsew')
-            tk.Label(cell, text=disp, bg=C['panel'], fg=col,
-                     font=('Segoe UI', 8, 'bold')).pack(pady=(6,2))
-            cv = tk.Canvas(cell, width=THUMB, height=THUMB, bg='#111',
-                           highlightthickness=1, highlightbackground=C['border'],
-                           cursor='hand2')
-            cv.pack(padx=6, pady=2)
-            cv.create_text(THUMB//2, THUMB//2, text='No image',
-                           fill=C['text_dim'], font=('Segoe UI', 7), tags='ph')
+        CELLS = [('basecolor','BASE COLOR',C['accent']),('normal','NORMAL','#569cd6'),('roughness','ROUGHNESS','#ce9178'),('metallic','METALLIC','#dcdcaa'),('height','HEIGHT','#4ec9b0'),('coatcolor','COAT COLOR','#c586c0'),('coatnormal','COAT NORMAL','#9cdcfe'),('coatroughness','COAT ROUGHNESS','#ff8c00'),]
+        for idx, (key, disp, col) in enumerate(CELLS):
+            r = idx // 4
+            c = idx % 4
+            cell = tk.Frame(gf, bg=C['panel'], highlightbackground=C['border'], highlightthickness=1)
+            cell.grid(row=r, column=c, padx=8, pady=8, sticky='nsew')
+            gf.rowconfigure(r, weight=1)
+            tk.Label(cell, text=disp, bg=C['panel'], fg=col, font=('Segoe UI', 10, 'bold')).pack(pady=(8,4))
+            THUMB = self._dl_thumb_size
+            cv = tk.Canvas(cell, width=THUMB, height=THUMB, bg='#111', highlightthickness=0, cursor='hand2')
+            cv.pack(padx=8, pady=4, expand=True, fill='both')
+            cv.create_text(THUMB//2, THUMB//2, text='No image', fill=C['text_dim'], font=('Segoe UI', 9), tags='ph')
             cv.bind('<Button-1>', lambda e, k=key: self._dl_open_preview(k))
-            tk.Label(cell, text='—', bg=C['panel'], fg=C['text_dim'],
-                     font=('Segoe UI', 7)).pack(pady=(0,6))
-            self._dl_cells[key] = {'canvas': cv, 'size': THUMB}
+            tk.Label(cell, text='Click to preview', bg=C['panel'], fg=C['text_dim'], font=('Segoe UI', 8)).pack(pady=(0,8))
+            self._dl_cells[key] = {'canvas': cv, 'size': THUMB, 'frame': cell}
+
+    def _dl_schedule_live(self):
+        if getattr(self, '_dl_live_job', None) is not None:
+            try:
+                self.root.after_cancel(self._dl_live_job)
+            except:
+                pass
+        self._dl_live_job = self.root.after(150, self._dl_generate)
 
     def _dl_pick_coat_color(self):
-        from tkinter import colorchooser
-        c = colorchooser.askcolor(title='Coat Color',
-                                   color=self._dl_coat_color)
-        if c and c[1]:
+        c = colorchooser.askcolor(self._dl_coat_color, title='Coat Color')
+        if c[1]:
             self._dl_coat_color = c[1]
-            r, g, b = [int(c[1][i:i+2],16) for i in (1,3,5)]
-            lum = r*0.299 + g*0.587 + b*0.114
-            self._dl_cc_btn.config(bg=c[1], text=f'  ■  {c[1]}  ',
-                                    fg='white' if lum < 128 else '#111')
+            self._dl_cc_btn.config(text=c[1], bg=c[1])
+            if hasattr(self, '_dl_live_enabled') and self._dl_live_enabled.get() and self._dl_src is not None:
+                self._dl_schedule_live()
 
     def _dl_update_cell(self, key, img):
         if key not in self._dl_cells: return
@@ -2534,92 +3336,180 @@ class TextureGeneratorApp:
 
     def _dl_generate(self):
         if self._dl_src is None: return
-
         def run():
             self._dl_prog.set(0)
-            img  = self._dl_src
+            img = self._dl_src
             w, h = img.size
-            arr  = np.array(img).astype(np.float32) / 255.0
-            lum  = (0.299*arr[:,:,0] + 0.587*arr[:,:,1] + 0.114*arr[:,:,2])
+            arr = np.array(img).astype(np.float32) / 255.0
+            lum = (0.299*arr[:,:,0] + 0.587*arr[:,:,1] + 0.114*arr[:,:,2]).astype(np.float32)
+            import cv2 as _cv2
+
+            def getv(k, d): 
+                try: return self._dl_vars[k].get()
+                except: return d
 
             steps = 8
             def prog(i): self.root.after(0, lambda: self._dl_prog.set(i/steps*100))
 
-            # 1 BaseColor
-            self._dl_maps['basecolor'] = img.copy()
-            self.root.after(0, lambda: self._dl_update_cell('basecolor', img))
+            # 1 BASE COLOR with Bright/Contrast/Sat
+            b_b = getv('base_brightness', 0.0)
+            b_c = getv('base_contrast', 1.0)
+            b_s = getv('base_saturation', 1.0)
+            base_arr = (arr - 0.5) * b_c + 0.5 + b_b
+            gray3 = lum[:,:,None]
+            base_arr = gray3 + (base_arr - gray3) * b_s
+            base_arr = np.clip(base_arr, 0, 1)
+            base_img = Image.fromarray((base_arr * 255).astype(np.uint8))
+            self._dl_maps['basecolor'] = base_img
+            self.root.after(0, lambda: self._dl_update_cell('basecolor', base_img))
             prog(1)
 
-            # 2 Normal — Sobel via cv2
-            import cv2 as _cv2
-            strength = self._dl_vars['normal_strength'].get()
-            dx = _cv2.Sobel(lum, _cv2.CV_32F, 1, 0, ksize=3) * strength
-            dy = _cv2.Sobel(lum, _cv2.CV_32F, 0, 1, ksize=3) * strength
-            dz = np.ones_like(lum)
+            # 2 NORMAL with blur, Z, flip, detail, Sobel/Scharr
+            n_str = getv('normal_strength', 3.0)
+            n_blur = getv('normal_blur', 0.0)
+            n_z = getv('normal_z', 1.0)
+            n_det = getv('normal_detail', 0.2)
+            lum_n = lum.copy()
+            if n_blur > 0.01:
+                lum_n = _cv2.GaussianBlur(lum_n, (0,0), n_blur)
+            mode = self._dl_normal_mode.get() if hasattr(self, '_dl_normal_mode') else 'Sobel'
+            if mode == 'Scharr':
+                dx = _cv2.Scharr(lum_n, _cv2.CV_32F, 1, 0) * n_str * 0.15
+                dy = _cv2.Scharr(lum_n, _cv2.CV_32F, 0, 1) * n_str * 0.15
+            else:
+                dx = _cv2.Sobel(lum_n, _cv2.CV_32F, 1, 0, ksize=3) * n_str
+                dy = _cv2.Sobel(lum_n, _cv2.CV_32F, 0, 1, ksize=3) * n_str
+            if hasattr(self, '_dl_flip_x') and self._dl_flip_x.get(): dx = -dx
+            if hasattr(self, '_dl_flip_y') and self._dl_flip_y.get(): dy = -dy
+            dz = np.ones_like(lum_n) * max(n_z, 0.01)
             length = np.sqrt(dx*dx + dy*dy + dz*dz)
-            nx = np.clip((dx/length*0.5+0.5)*255, 0, 255)
-            ny = np.clip((dy/length*0.5+0.5)*255, 0, 255)
-            nz = np.clip((dz/length*0.5+0.5)*255, 0, 255)
-            # Store as RGB (R=X, G=Y, B=Z)
-            norm_arr = np.stack([nx, ny, nz], axis=-1).astype(np.uint8)
-            norm_img = Image.fromarray(norm_arr)
+            nx = dx/length*0.5+0.5
+            ny = dy/length*0.5+0.5
+            nz = dz/length*0.5+0.5
+            if n_det > 0.001:
+                hp = lum - _cv2.GaussianBlur(lum, (0,0), 2.0)
+                nx = np.clip(nx + hp * n_det * 0.5, 0, 1)
+                ny = np.clip(ny + hp * n_det * 0.5, 0, 1)
+            norm_arr = np.stack([nx, ny, nz], axis=-1) * 255.0
+            norm_img = Image.fromarray(norm_arr.astype(np.uint8))
             self._dl_maps['normal'] = norm_img
             self.root.after(0, lambda: self._dl_update_cell('normal', norm_img))
             prog(2)
 
-            # 3 Roughness
+            # 3 ROUGHNESS with min/max/gamma/blur/AO mix
+            r_con = getv('rough_contrast', 1.0)
+            r_min = getv('rough_min', 0.0)
+            r_max = getv('rough_max', 1.0)
+            r_gam = getv('rough_gamma', 1.0)
+            r_blur = getv('rough_blur', 0.0)
+            r_ao = getv('rough_ao_mix', 0.0)
             rough = lum.copy()
-            if self._dl_rough_inv.get(): rough = 1.0 - rough
-            contrast = self._dl_vars['rough_contrast'].get()
-            rough = np.clip((rough - 0.5)*contrast + 0.5, 0, 1)
+            if hasattr(self, '_dl_rough_inv') and self._dl_rough_inv.get(): rough = 1.0 - rough
+            rough = r_min + rough * (r_max - r_min)
+            rough = np.power(np.clip(rough, 0.001, 0.999), max(r_gam,0.01))
+            rough = np.clip((rough - 0.5) * r_con + 0.5, 0, 1)
+            if r_blur > 0.01:
+                rough = _cv2.GaussianBlur(rough, (0,0), r_blur)
+            # AO mix will be applied after height calc, store for now
+            self._dl_temp_rough = rough
             rough_img = Image.fromarray((rough*255).astype(np.uint8))
             self._dl_maps['roughness'] = rough_img
             self.root.after(0, lambda: self._dl_update_cell('roughness', rough_img))
             prog(3)
 
-            # 4 Metallic (flat)
-            mv = int(self._dl_vars['metallic'].get() * 255)
-            metal_img = Image.new('L', (w, h), mv)
+            # 4 METALLIC with modes
+            m_mode = self._dl_metal_mode.get() if hasattr(self, '_dl_metal_mode') else 'Flat'
+            m_level = getv('metallic', 0.0)
+            m_thr = getv('metal_thresh', 0.6)
+            m_tol = getv('metal_toler', 0.1)
+            m_con = getv('metal_contrast', 1.0)
+            m_blur = getv('metal_blur', 0.0)
+            if m_mode == 'Flat':
+                metal = np.ones_like(lum) * m_level
+            elif m_mode == 'Threshold':
+                # smoothstep threshold
+                lo = max(m_thr - m_tol, 0.0)
+                hi = min(m_thr + m_tol, 1.0)
+                denom = max(hi-lo, 0.001)
+                metal = np.clip((lum - lo) / denom, 0, 1)
+            else: # Color Detect
+                maxc = arr.max(axis=2)
+                minc = arr.min(axis=2)
+                sat = maxc - minc
+                # low sat + bright = metal
+                metal = np.where((sat < 0.15) & (lum > m_thr), 1.0, 0.0).astype(np.float32)
+                # feather with tolerance
+                metal = _cv2.GaussianBlur(metal, (0,0), m_tol*5+0.5) if m_tol>0 else metal
+            metal = np.clip((metal - 0.5) * m_con + 0.5, 0, 1)
+            if m_blur > 0.01:
+                metal = _cv2.GaussianBlur(metal, (0,0), m_blur)
+            metal_img = Image.new('L', (w,h), 0)
+            metal_img = Image.fromarray((metal*255).astype(np.uint8))
             self._dl_maps['metallic'] = metal_img
             self.root.after(0, lambda: self._dl_update_cell('metallic', metal_img))
             prog(4)
 
-            # 5 Height/Parallax
-            ht = lum.copy()
-            if self._dl_height_inv.get(): ht = 1.0 - ht
+            # 5 HEIGHT with source / contrast / midlevel
+            h_src_mode = self._dl_height_src.get() if hasattr(self, '_dl_height_src') else 'Luminance'
+            if h_src_mode == 'Red Channel': ht = arr[:,:,0]
+            elif h_src_mode == 'Average': ht = arr.mean(axis=2)
+            else: ht = lum.copy()
+            if hasattr(self, '_dl_height_inv') and self._dl_height_inv.get(): ht = 1.0 - ht
+            h_con = getv('height_contrast', 1.0)
+            h_bri = getv('height_brightness', 0.0)
+            h_blur = getv('height_blur', 0.0)
+            h_mid = getv('height_midlevel', 0.5)
+            ht = np.clip((ht - 0.5) * h_con + 0.5 + h_bri, 0, 1)
+            ht = np.clip(ht - (h_mid - 0.5), 0, 1)
+            if h_blur > 0.01:
+                ht = _cv2.GaussianBlur(ht, (0,0), h_blur)
             height_img = Image.fromarray((ht*255).astype(np.uint8))
             self._dl_maps['height'] = height_img
             self.root.after(0, lambda: self._dl_update_cell('height', height_img))
             prog(5)
 
-            # 6 Coat Color
+            # Apply AO mix to roughness now that we have height
+            ao_str = getv('ao_strength', 1.0)
+            ao_rad = getv('ao_radius', 3.0)
+            # simple AO = inverted blurred height
+            ao = 1.0 - _cv2.GaussianBlur(1.0 - ht, (0,0), max(ao_rad,0.1)) * ao_str
+            ao = np.clip(ao, 0, 1)
+            if r_ao > 0.001:
+                rough_final = self._dl_temp_rough * (1.0 - r_ao) + (1.0 - ao) * r_ao
+                rough_final = np.clip(rough_final, 0, 1)
+                rough_img2 = Image.fromarray((rough_final*255).astype(np.uint8))
+                self._dl_maps['roughness'] = rough_img2
+                self.root.after(0, lambda: self._dl_update_cell('roughness', rough_img2))
+
+            # 6 COAT COLOR
             hex_c = self._dl_coat_color
             rgb = tuple(int(hex_c[i:i+2],16) for i in (1,3,5))
-            op  = self._dl_vars['coat_opacity'].get()
-            coat = Image.new('RGB', (w, h), rgb)
-            if op < 1.0:
+            op = getv('coat_opacity', 0.0)
+            coat = Image.new('RGB', (w,h), rgb)
+            if op < 0.999:
                 coat = Image.blend(Image.new('RGB',(w,h),(0,0,0)), coat, op)
             self._dl_maps['coatcolor'] = coat
             self.root.after(0, lambda: self._dl_update_cell('coatcolor', coat))
             prog(6)
 
-            # 7 Coat Normal
-            if self._dl_use_coat_normal.get():
+            # 7 COAT NORMAL
+            cn_str = getv('coat_normal_str', 1.0)
+            if hasattr(self, '_dl_use_coat_normal') and self._dl_use_coat_normal.get():
                 from PIL import ImageFilter
-                cn = norm_img.filter(ImageFilter.GaussianBlur(5))
+                blur_rad = max(2.0 * cn_str, 0.5)
+                cn = norm_img.filter(ImageFilter.GaussianBlur(blur_rad))
             else:
-                cn = Image.new('RGB', (w, h), (128, 128, 255))
+                cn = Image.new('RGB', (w,h), (128,128,255))
             self._dl_maps['coatnormal'] = cn
             self.root.after(0, lambda: self._dl_update_cell('coatnormal', cn))
             prog(7)
 
-            # 8 Coat Roughness (flat)
-            cr = int(self._dl_vars['coat_roughness'].get() * 255)
-            cr_img = Image.new('L', (w, h), cr)
+            # 8 COAT ROUGHNESS
+            cr = int(getv('coat_roughness', 0.2) * 255)
+            cr_img = Image.new('L', (w,h), cr)
             self._dl_maps['coatroughness'] = cr_img
             self.root.after(0, lambda: self._dl_update_cell('coatroughness', cr_img))
             prog(8)
-
             self.root.after(0, lambda: self._dl_prog.set(100))
 
         threading.Thread(target=run, daemon=True).start()
@@ -2660,7 +3550,7 @@ class TextureGeneratorApp:
         right = tk.Frame(parent, bg=C['panel'])
         right.pack(side='right', fill='both', expand=True)
 
-        _, sf = self._make_scrollable(left, C['surface'])
+        self._dl_scroll_canvas, sf = self._make_scrollable(left, C['surface'])
 
         self._section_lbl(sf, '_p MAP BUILDER',
             'Batch-generates _n (normal map) and _p (height map) PNG files for every '
@@ -2668,8 +3558,8 @@ class TextureGeneratorApp:
             'map suffixes.')
 
         # Folders
-        self._pm_in_var  = self.input_dir
-        self._pm_out_var = self.output_dir
+        self._pm_in_var  = tk.StringVar(value=self.input_dir.get())
+        self._pm_out_var = tk.StringVar(value=self.output_dir.get())
         self._folder_row(sf, 'Input Folder',  self._pm_in_var)
         self._folder_row(sf, 'Output Folder', self._pm_out_var)
 
@@ -2686,9 +3576,9 @@ class TextureGeneratorApp:
                                fg=C['text_bright'], font=('Consolas', 8), width=6)
             val_lbl.pack(side='right')
             tk.Scale(row, from_=lo, to=hi, resolution=res, orient='horizontal',
-                     variable=var, bg=C['surface'], fg=C['text'],
-                     troughcolor=C['input'], highlightthickness=0,
-                     showvalue=False, sliderlength=14,
+                     variable=var, bg=C['accent'], fg=C['text'],
+                     troughcolor=C['input'], highlightthickness=0, activebackground=C['accent_hi'],
+                     showvalue=False, sliderlength=14, sliderrelief='raised', bd=1,
                      command=lambda v, l=val_lbl: l.config(text=f'{float(v):.3f}')
                      ).pack(fill='x', expand=True, padx=(0,4))
             self._pm_vars[key] = var
@@ -2717,9 +3607,13 @@ class TextureGeneratorApp:
                  font=('Segoe UI', 8)).pack(anchor='w', padx=16)
         self._pm_fmt_var = tk.StringVar(value='PNG')
         fmt_row = tk.Frame(sf, bg=C['surface']); fmt_row.pack(fill='x', padx=16, pady=4)
-        for fmt in ['PNG','TGA','BMP']:
+        for fmt in ['PNG','TGA','BMP','DDS']:
             ttk.Radiobutton(fmt_row, text=fmt, variable=self._pm_fmt_var, value=fmt,
                             style='Dark.TRadiobutton').pack(side='left', padx=(0,12))
+        tk.Label(sf, text='DDS output: _n uses BC7_UNORM, _p uses BC4_UNORM '
+                          '(same defaults as DDS Tool/Resize Tool\'s rules)',
+                 bg=C['surface'], fg=C['text_dim'],
+                 font=('Segoe UI', 7)).pack(anchor='w', padx=16)
 
         self._sep(sf)
         self._mkbtn(sf, '▶  Run Batch Builder', self._pm_run,
@@ -2757,6 +3651,10 @@ class TextureGeneratorApp:
         skip_raw   = self._pm_skip_var.get()
         skip_sfx   = tuple(s.strip().lower() for s in skip_raw.split(',') if s.strip())
         fmt        = self._pm_fmt_var.get().lower()
+
+        if fmt == 'dds' and not self.texconv_ok:
+            messagebox.showerror('texconv required', 'DDS output requires texconv.exe.')
+            return
 
         def run():
             self._clear_log(self.pm_log)
@@ -2822,11 +3720,36 @@ class TextureGeneratorApp:
                     height_img = Image.fromarray(
                         (height * 255.0).clip(0,255).astype(np.uint8))
 
-                    normal_img.save(os.path.join(out_d, f'{base}_n.{fmt}'))
-                    height_img.save(os.path.join(out_d, f'{base}_p.{fmt}'))
+                    if fmt == 'dds':
+                        # Save PNG first (texconv needs a real file to read),
+                        # then compress each to its own format - same pattern
+                        # Normal Map Generator uses, and the same default
+                        # formats DDS Tool/Resize Tool assign to _n/_p.
+                        n_png = os.path.join(out_d, f'{base}_n.png')
+                        p_png = os.path.join(out_d, f'{base}_p.png')
+                        normal_img.save(n_png)
+                        height_img.save(p_png)
+
+                        n_dds = os.path.join(out_d, f'{base}_n.dds')
+                        p_dds = os.path.join(out_d, f'{base}_p.dds')
+                        n_ok = _tc_compress(n_png, n_dds, 'BC7_UNORM')
+                        p_ok = _tc_compress(p_png, p_dds, 'BC4_UNORM')
+
+                        if n_ok: os.remove(n_png)
+                        else: self._log(self.pm_log, '  ⚠ _n DDS compress failed, kept PNG', C['warn'])
+                        if p_ok: os.remove(p_png)
+                        else: self._log(self.pm_log, '  ⚠ _p DDS compress failed, kept PNG', C['warn'])
+
+                        n_name = f'{base}_n.dds' if n_ok else f'{base}_n.png'
+                        p_name = f'{base}_p.dds' if p_ok else f'{base}_p.png'
+                    else:
+                        normal_img.save(os.path.join(out_d, f'{base}_n.{fmt}'))
+                        height_img.save(os.path.join(out_d, f'{base}_p.{fmt}'))
+                        n_name = f'{base}_n.{fmt}'
+                        p_name = f'{base}_p.{fmt}'
 
                     self._log(self.pm_log,
-                              f'  ✓ {base}_n.{fmt}  +  {base}_p.{fmt}', C['success'])
+                              f'  ✓ {n_name}  +  {p_name}', C['success'])
                     ok_count += 1
                 except Exception as e:
                     self._log(self.pm_log, f'  ✗ {e}', C['error'])
@@ -2843,7 +3766,7 @@ class TextureGeneratorApp:
 def main():
     root = tk.Tk()
     try:
-        icon = resource_path('icon.ico')
+        icon = resource_path('TG_ICO.ico')
         if os.path.exists(icon): root.iconbitmap(icon)
     except Exception: pass
     TextureGeneratorApp(root)
