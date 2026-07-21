@@ -1,0 +1,22 @@
+
+FIXED: IndentationError at line 3570 depth_pil = _la.estimate_depth_pil if _la else None
+
+Previous v1.1.18 had broken patch that caused:
+  File "texture_generator.py", line 3570
+    depth_pil = _la.estimate_depth_pil if _la else None
+  IndentationError: unexpected indent
+
+This caused PyInstaller to say "Build complete. Check dist/TG3.exe" but actually fail and leave dist empty.
+
+FIXED in v1.1.18_FIXED:
+- Rewrote AI height block cleanly with proper indentation
+- Lazy loading now works, fast startup
+- Tested syntax with ast.parse - OK
+
+BUILD:
+python -m PyInstaller TG3_Light.spec
+-> dist/TG3_Light.exe will now actually appear
+
+If using original TG3.spec, it will be dist/TG3.exe
+
+If dist still empty, delete build/ and __pycache__/ folders first, then build again.

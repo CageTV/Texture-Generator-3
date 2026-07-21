@@ -33,14 +33,25 @@ except Exception as e:
     _MAT_OK = False
     _MAT_ERR = f'{type(e).__name__}: {e}'
 
-try:
-    import ai_depth_engine as _ai
-    _AI_OK = _ai.is_ai_available()
-    _AI_ERR = None
-except Exception as e:
-    _AI_OK = False
-    _AI_ERR = f'{type(e).__name__}: {e}'
-    _ai = None
+# LAZY AI - don't import at startup, fixes slow load
+_ai = None
+_AI_OK = False
+_AI_ERR = None
+def _lazy_load_ai():
+    global _ai, _AI_OK, _AI_ERR
+    if _ai is not None:
+        return _ai
+    try:
+        import ai_depth_engine as _ai_mod
+        _ai = _ai_mod
+        _AI_OK = _ai_mod.is_ai_available()
+        _AI_ERR = None
+        return _ai
+    except Exception as e:
+        _AI_OK = False
+        _AI_ERR = f'{type(e).__name__}: {e}'
+        return None
+
 
 try:
     import material_preview as _mp
@@ -2591,7 +2602,7 @@ class TextureGeneratorApp:
         mrow.pack(fill='x', padx=8, pady=2)
         tk.Label(mrow, text='Model:', bg=C['panel'], fg=C['text'], font=('Segoe UI', 8), width=12, anchor='w').pack(side='left')
         try:
-            models = _ai.get_available_models() if _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+            models = _lazy_load_ai().get_available_models() if _lazy_load_ai() else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         except:
             models = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         cb = ttk.Combobox(mrow, textvariable=self._mat_ai_model_var, values=models, state='readonly', font=('Segoe UI', 8), width=22)
@@ -3206,7 +3217,7 @@ class TextureGeneratorApp:
         ttk.Checkbutton(ai_hdr, text='', variable=self._dl_ai_enabled, style='Panel.TCheckbutton').pack(side='left')
         tk.Label(ai_hdr, text='USE AI DEPTH (High Quality like reference)', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 9, 'bold')).pack(side='left', padx=4)
         try:
-            _ai_models_dl = _ai.get_available_models() if '_AI_OK' in globals() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+            _ai_models_dl = _lazy_load_ai().get_available_models() if _lazy_load_ai() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         except:
             _ai_models_dl = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         tk.Label(ai_hdr, text='Model:', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 8)).pack(side='left', padx=(12,2))
@@ -3541,9 +3552,10 @@ class TextureGeneratorApp:
 
             # 5 HEIGHT with AI Depth support (reference quality)
             # Check if AI Depth enabled
+            _lazy_load_ai()
             use_ai_dl = False
             try:
-                use_ai_dl = self._dl_ai_enabled.get() and '_AI_OK' in globals() and _AI_OK and _ai is not None
+                use_ai_dl = self._dl_ai_enabled.get() and _AI_OK and _ai is not None
             except:
                 use_ai_dl = False
             
@@ -3551,10 +3563,15 @@ class TextureGeneratorApp:
                 try:
                     # Use AI depth engine for reference-like depth
                     pil_src = Image.fromarray((arr * 255).astype(np.uint8))
-                    model_type = self._dl_ai_model_var.get() if hasattr(self, '_dl_ai_model_var') else 'depth-anything-small'
-                    detail_blend = self._dl_ai_detail_var.get() if hasattr(self, '_dl_ai_detail_var') else 0.15
+                    model_type = self._dl_ai_model_var.get() if hasattr(self, '_dl_ai_model_var') else 'depth-anything-v2-large'
+                    detail_blend = self._dl_ai_detail_var.get() if hasattr(self, '_dl_ai_detail_var') else 0.35
                     strength_ai = self._dl_ai_strength_var.get() if hasattr(self, '_dl_ai_strength_var') else 1.0
-                    depth_pil = _ai.estimate_depth_pil(pil_src, model_type=model_type, detail_blend=detail_blend)
+                    _la = _lazy_load_ai()
+                    depth_pil = None
+                    if _la is not None:
+                        depth_pil = _la.estimate_depth_pil(pil_src, model_type=model_type, detail_blend=detail_blend, use_guided=True, high_res=True)
+                    if depth_pil is None:
+                        raise RuntimeError("AI depth returned None")
                     ht = np.array(depth_pil).astype(np.float32) / 255.0
                     # Apply contrast/brightness/midlevel on top of AI depth
                     h_con = getv('height_contrast', 1.0)
@@ -3729,7 +3746,7 @@ class TextureGeneratorApp:
         mr = tk.Frame(ai_f, bg='#2a2a1a'); mr.pack(fill='x', padx=8, pady=2)
         tk.Label(mr, text='Model:', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 8)).pack(side='left')
         try:
-            _ai_models_pm = _ai.get_available_models() if '_AI_OK' in globals() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+            _ai_models_pm = _lazy_load_ai().get_available_models() if _lazy_load_ai() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         except:
             _ai_models_pm = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
         ttk.Combobox(mr, textvariable=self._pm_ai_model_var, values=_ai_models_pm, state='readonly', width=20).pack(side='left', padx=4)
@@ -3852,7 +3869,9 @@ class TextureGeneratorApp:
                     # Height field - with AI Depth support
                     if use_ai_pm and '_AI_OK' in globals() and _AI_OK and _ai is not None:
                         try:
-                            depth_pil = _ai.estimate_depth_pil(img, model_type=ai_model_pm, detail_blend=ai_detail_pm)
+                            _la = _lazy_load_ai()
+                            depth_pil = None
+                            if depth_pil: depth_pil = _la.estimate_depth_pil(img, model_type=ai_model_pm, detail_blend=ai_detail_pm)
                             height = np.array(depth_pil).astype(np.float32) / 255.0
                             if blur_r > 0:
                                 height_pil = Image.fromarray((height*255).astype(np.uint8))
