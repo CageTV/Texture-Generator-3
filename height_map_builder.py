@@ -6,6 +6,12 @@ from PIL import Image, ImageFilter
 import subprocess
 
 import platform_tools as _pt
+try:
+    import ai_depth_engine as _ai
+    _AI_OK = _ai.is_ai_available()
+except:
+    _AI_OK = False
+    _ai = None
 
 STRENGTH = 6.0
 BLUR_RADIUS = 2.5
@@ -20,7 +26,27 @@ except Exception as e:
     print(f"[GPU] disabled: {e}")
     _GPU_OK = False
 
-def get_height_field(image, blur=BLUR_RADIUS):
+def get_height_field(image, blur=BLUR_RADIUS, use_ai=False, ai_model="depth-anything-small", ai_detail=0.15):
+    # AI path for reference-quality depth
+    if use_ai and _AI_OK and _ai is not None:
+        try:
+            depth_pil = _ai.estimate_depth_pil(image, model_type=ai_model, detail_blend=ai_detail)
+            h = np.array(depth_pil, dtype=np.float32) / 255.0
+            if NORMALIZE_HEIGHT:
+                mn, mx = h.min(), h.max()
+                if mx > mn:
+                    h = (h - mn) / (mx - mn)
+            # Apply blur if requested
+            if blur > 0:
+                from PIL import ImageFilter as _IF
+                # Convert to PIL for blur then back
+                tmp = Image.fromarray((h*255).astype(np.uint8))
+                tmp = tmp.filter(_IF.GaussianBlur(blur))
+                h = np.array(tmp, dtype=np.float32) / 255.0
+            return h
+        except Exception as e:
+            print(f"[HMB] AI depth failed: {e}, fallback to luminance")
+
     gray = image.convert("L")
     if blur > 0:
         gray = gray.filter(ImageFilter.GaussianBlur(blur))
@@ -73,7 +99,8 @@ def save_with_formats(img, base_path, formats, texconv_path=None):
             except: pass
 
 def process_folder(in_dir, out_dir, formats=("png",), strength=STRENGTH,
-                   blur=BLUR_RADIUS, texconv_path=None, progress=None):
+                   blur=BLUR_RADIUS, texconv_path=None, progress=None,
+                   use_ai=False, ai_model="depth-anything-small", ai_detail=0.15):
     in_dir = Path(in_dir); out_dir = Path(out_dir)
     if not in_dir.is_dir(): return 0
     exts = {".png",".bmp",".tga",".jpg",".jpeg",".tif",".tiff"}
@@ -86,7 +113,7 @@ def process_folder(in_dir, out_dir, formats=("png",), strength=STRENGTH,
         if should_skip(src.name): continue
         try:
             img = Image.open(src).convert("RGB")
-            h = get_height_field(img, blur)
+            h = get_height_field(img, blur, use_ai=use_ai, ai_model=ai_model, ai_detail=ai_detail)
             normal = generate_normal_from_height(h, strength)
             height = generate_height_map(h)
             rel = src.relative_to(in_dir).with_suffix("")

@@ -15,6 +15,14 @@ Maps generated:
 
 import numpy as np
 import cv2
+
+try:
+    import ai_depth_engine as _ai
+    _AI_OK = _ai.is_ai_available()
+except Exception as _ai_e:
+    _AI_OK = False
+    _ai = None
+    print(f"[Material Engine] AI depth disabled: {_ai_e}")
 from PIL import Image
 from pathlib import Path
 from typing import Callable, Optional, Dict
@@ -95,7 +103,11 @@ def height_from_diffuse(img: np.ndarray,
                         blur_radius: float = 2.0,
                         contrast: float = 1.0,
                         brightness: float = 0.0,
-                        invert: bool = False) -> np.ndarray:
+                        invert: bool = False,
+                        use_ai: bool = False,
+                        ai_model: str = "depth-anything-small",
+                        ai_detail: float = 0.15,
+                        ai_strength: float = 1.0) -> np.ndarray:
     """
     Extract height map from luminance of the diffuse texture.
     blur_radius  – Gaussian smooth (0 = off)
@@ -103,6 +115,29 @@ def height_from_diffuse(img: np.ndarray,
     brightness   – additive offset (−1 … +1)
     invert       – flip height direction
     """
+    # --- AI Depth path - gives you that reference quality ---
+    if use_ai and _AI_OK and _ai is not None:
+        try:
+            from PIL import Image as _PILImage
+            # Convert BGR numpy to PIL RGB
+            if img.ndim == 3:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                pil = _PILImage.fromarray(rgb)
+            else:
+                pil = _PILImage.fromarray(img).convert("RGB")
+            # AI depth estimation - this is where we get reference-like smooth depth
+            depth_pil = _ai.estimate_depth_pil(pil, model_type=ai_model, detail_blend=ai_detail, invert=False)
+            h = np.array(depth_pil).astype(np.float32) / 255.0
+            # Apply contrast/brightness on top of AI depth for artistic control
+            h = np.clip((h - 0.5) * contrast * ai_strength + 0.5 + brightness, 0, 1)
+            h = _blur(h, blur_radius) if blur_radius > 0 else h
+            if invert:
+                h = 1.0 - h
+            return np.clip(h * 255, 0, 255).astype(np.uint8)
+        except Exception as e:
+            print(f"[Height] AI depth failed, falling back to luminance: {e}")
+
+    # --- Fallback heuristic (original) ---
     h = _gray(img) / 255.0
     h = np.clip((h - 0.5) * contrast + 0.5 + brightness, 0, 1)
     h = _blur(h, blur_radius)

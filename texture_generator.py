@@ -34,6 +34,15 @@ except Exception as e:
     _MAT_ERR = f'{type(e).__name__}: {e}'
 
 try:
+    import ai_depth_engine as _ai
+    _AI_OK = _ai.is_ai_available()
+    _AI_ERR = None
+except Exception as e:
+    _AI_OK = False
+    _AI_ERR = f'{type(e).__name__}: {e}'
+    _ai = None
+
+try:
     import material_preview as _mp
     _MP_OK = True
     _MP_ERR = None
@@ -2557,6 +2566,51 @@ class TextureGeneratorApp:
             ttk.Radiobutton(fmt_r, text=fmt, variable=self._mat_fmt_var, value=fmt,
                             style='Dark.TRadiobutton').pack(side='left', padx=(0, 10))
 
+        # ── AI Depth (High Quality) ─────────────────────────────────────────
+        self._sep(sf)
+        self._section_lbl(sf, 'AI DEPTH - HIGH QUALITY (like reference)',
+            'Replaces luminance height with AI depth. Gives you that smooth sculpted depth like your reference image, then normal is derived from it. Requires torch + transformers. Falls back to luminance if not installed.')
+
+        ai_card = tk.Frame(sf, bg=C['panel'])
+        ai_card.pack(fill='x', padx=16, pady=3)
+
+        self._mat_ai_enabled = tk.BooleanVar(value=False)
+        self._mat_ai_model_var = tk.StringVar(value='depth-anything-small')
+        self._mat_ai_detail_var = tk.DoubleVar(value=0.15)
+        self._mat_ai_strength_var = tk.DoubleVar(value=1.0)
+
+        hdr = tk.Frame(ai_card, bg=C['panel'])
+        hdr.pack(fill='x', padx=8, pady=(6,2))
+        ttk.Checkbutton(hdr, text='', variable=self._mat_ai_enabled, style='Panel.TCheckbutton').pack(side='left')
+        tk.Label(hdr, text='USE AI DEPTH', bg=C['panel'], fg='#ffcc00', font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(2,8))
+        if not _AI_OK:
+            tk.Label(hdr, text='(torch/transformers not installed - will use luminance)', bg=C['panel'], fg=C['warn'], font=('Segoe UI', 7)).pack(side='left')
+
+        # Model row
+        mrow = tk.Frame(ai_card, bg=C['panel'])
+        mrow.pack(fill='x', padx=8, pady=2)
+        tk.Label(mrow, text='Model:', bg=C['panel'], fg=C['text'], font=('Segoe UI', 8), width=12, anchor='w').pack(side='left')
+        try:
+            models = _ai.get_available_models() if _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        except:
+            models = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        cb = ttk.Combobox(mrow, textvariable=self._mat_ai_model_var, values=models, state='readonly', font=('Segoe UI', 8), width=22)
+        cb.pack(side='left', padx=(4,0))
+        tk.Label(mrow, text='small=fast CPU, marigold=quality GPU (like lucidrains Unet)', bg=C['panel'], fg=C['text_dim'], font=('Segoe UI', 7)).pack(side='left', padx=(6,0))
+
+        # Detail blend row
+        drow = tk.Frame(ai_card, bg=C['panel'])
+        drow.pack(fill='x', padx=8, pady=2)
+        tk.Label(drow, text='Detail Blend:', bg=C['panel'], fg=C['text'], font=('Segoe UI', 7), width=12, anchor='w').pack(side='left')
+        tk.Scale(drow, from_=0.0, to=0.5, resolution=0.05, orient='horizontal', variable=self._mat_ai_detail_var, bg=C['panel'], fg=C['text'], highlightthickness=0, length=140, font=('Segoe UI', 7)).pack(side='left')
+        tk.Label(drow, text='0= smooth like ref, 0.15= preserve engravings', bg=C['panel'], fg=C['text_dim'], font=('Segoe UI', 7)).pack(side='left', padx=(4,0))
+
+        # Strength row
+        srow = tk.Frame(ai_card, bg=C['panel'])
+        srow.pack(fill='x', padx=8, pady=2)
+        tk.Label(srow, text='AI Strength:', bg=C['panel'], fg=C['text'], font=('Segoe UI', 7), width=12, anchor='w').pack(side='left')
+        tk.Scale(srow, from_=0.2, to=2.0, resolution=0.1, orient='horizontal', variable=self._mat_ai_strength_var, bg=C['panel'], fg=C['text'], highlightthickness=0, length=140, font=('Segoe UI', 7)).pack(side='left')
+
         # ── Map settings ──────────────────────────────────────────────────────
         self._sep(sf)
         self._section_lbl(sf, 'MAP SETTINGS',
@@ -3042,6 +3096,15 @@ class TextureGeneratorApp:
                 if key.startswith('_'): continue
                 settings[map_name][key] = var.get()
 
+        # Inject AI Depth params into height
+        try:
+            settings['height']['use_ai'] = self._mat_ai_enabled.get()
+            settings['height']['ai_model'] = self._mat_ai_model_var.get()
+            settings['height']['ai_detail'] = self._mat_ai_detail_var.get()
+            settings['height']['ai_strength'] = self._mat_ai_strength_var.get()
+        except Exception as e:
+            print(f"[AI] Could not inject AI settings: {e}")
+
         fmt = self._mat_fmt_var.get().lower()
 
         # Clear status
@@ -3088,6 +3151,11 @@ class TextureGeneratorApp:
         self._dl_live_enabled = tk.BooleanVar(value=True)
         self._dl_live_job = None
         self._dl_thumb_size = 260
+        # AI Depth vars for Dual Layer
+        self._dl_ai_enabled = tk.BooleanVar(value=False)
+        self._dl_ai_model_var = tk.StringVar(value='depth-anything-small')
+        self._dl_ai_detail_var = tk.DoubleVar(value=0.15)
+        self._dl_ai_strength_var = tk.DoubleVar(value=1.0)
 
         # Main vertical split: top = previews (expandable), bottom = controls
         main = tk.Frame(parent, bg=C['bg'])
@@ -3129,6 +3197,28 @@ class TextureGeneratorApp:
 
         self._mkbtn(top_ctrl, 'Load Diffuse', _pick_src, pad=(14,8), font=('Segoe UI', 9, 'bold')).pack(side='left', padx=4)
         ttk.Checkbutton(top_ctrl, text='Live Preview', variable=self._dl_live_enabled, style='Dark.TCheckbutton').pack(side='left', padx=12)
+
+        # AI Depth toggle for Dual Layer
+        ai_frame = tk.Frame(sf, bg='#2a2a1a', highlightbackground='#ffcc00', highlightthickness=1)
+        ai_frame.pack(fill='x', padx=12, pady=6)
+        ai_hdr = tk.Frame(ai_frame, bg='#2a2a1a')
+        ai_hdr.pack(fill='x', padx=8, pady=4)
+        ttk.Checkbutton(ai_hdr, text='', variable=self._dl_ai_enabled, style='Panel.TCheckbutton').pack(side='left')
+        tk.Label(ai_hdr, text='USE AI DEPTH (High Quality like reference)', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 9, 'bold')).pack(side='left', padx=4)
+        try:
+            _ai_models_dl = _ai.get_available_models() if '_AI_OK' in globals() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        except:
+            _ai_models_dl = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        tk.Label(ai_hdr, text='Model:', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 8)).pack(side='left', padx=(12,2))
+        cmb_ai_dl = ttk.Combobox(ai_hdr, textvariable=self._dl_ai_model_var, values=_ai_models_dl, state='readonly', width=18, font=('Segoe UI', 8))
+        cmb_ai_dl.pack(side='left', padx=2)
+        cmb_ai_dl.bind('<<ComboboxSelected>>', lambda e: self._dl_schedule_live() if self._dl_live_enabled.get() else None)
+        # Detail slider
+        dframe = tk.Frame(ai_frame, bg='#2a2a1a')
+        dframe.pack(fill='x', padx=8, pady=2)
+        tk.Label(dframe, text='Detail Blend:', bg='#2a2a1a', fg='#e0d0a0', font=('Segoe UI', 7), width=12, anchor='w').pack(side='left')
+        tk.Scale(dframe, from_=0.0, to=0.5, resolution=0.05, orient='horizontal', variable=self._dl_ai_detail_var, bg='#2a2a1a', fg='#e0d0a0', highlightthickness=0, length=120, font=('Segoe UI', 7), command=lambda v: self._dl_schedule_live() if self._dl_live_enabled.get() else None).pack(side='left')
+        tk.Label(dframe, text='0=smooth ref, 0.15=keep engravings', bg='#2a2a1a', fg='#a09060', font=('Segoe UI', 7)).pack(side='left', padx=4)
 
         # Controls columns frame
         cols_frame = tk.Frame(sf, bg=C['surface'])
@@ -3449,20 +3539,62 @@ class TextureGeneratorApp:
             self.root.after(0, lambda: self._dl_update_cell('metallic', metal_img))
             prog(4)
 
-            # 5 HEIGHT with source / contrast / midlevel
-            h_src_mode = self._dl_height_src.get() if hasattr(self, '_dl_height_src') else 'Luminance'
-            if h_src_mode == 'Red Channel': ht = arr[:,:,0]
-            elif h_src_mode == 'Average': ht = arr.mean(axis=2)
-            else: ht = lum.copy()
-            if hasattr(self, '_dl_height_inv') and self._dl_height_inv.get(): ht = 1.0 - ht
-            h_con = getv('height_contrast', 1.0)
-            h_bri = getv('height_brightness', 0.0)
-            h_blur = getv('height_blur', 0.0)
-            h_mid = getv('height_midlevel', 0.5)
-            ht = np.clip((ht - 0.5) * h_con + 0.5 + h_bri, 0, 1)
-            ht = np.clip(ht - (h_mid - 0.5), 0, 1)
-            if h_blur > 0.01:
-                ht = _cv2.GaussianBlur(ht, (0,0), h_blur)
+            # 5 HEIGHT with AI Depth support (reference quality)
+            # Check if AI Depth enabled
+            use_ai_dl = False
+            try:
+                use_ai_dl = self._dl_ai_enabled.get() and '_AI_OK' in globals() and _AI_OK and _ai is not None
+            except:
+                use_ai_dl = False
+            
+            if use_ai_dl:
+                try:
+                    # Use AI depth engine for reference-like depth
+                    pil_src = Image.fromarray((arr * 255).astype(np.uint8))
+                    model_type = self._dl_ai_model_var.get() if hasattr(self, '_dl_ai_model_var') else 'depth-anything-small'
+                    detail_blend = self._dl_ai_detail_var.get() if hasattr(self, '_dl_ai_detail_var') else 0.15
+                    strength_ai = self._dl_ai_strength_var.get() if hasattr(self, '_dl_ai_strength_var') else 1.0
+                    depth_pil = _ai.estimate_depth_pil(pil_src, model_type=model_type, detail_blend=detail_blend)
+                    ht = np.array(depth_pil).astype(np.float32) / 255.0
+                    # Apply contrast/brightness/midlevel on top of AI depth
+                    h_con = getv('height_contrast', 1.0)
+                    h_bri = getv('height_brightness', 0.0)
+                    h_blur = getv('height_blur', 0.0)
+                    h_mid = getv('height_midlevel', 0.5)
+                    ht = np.clip((ht - 0.5) * h_con * strength_ai + 0.5 + h_bri, 0, 1)
+                    ht = np.clip(ht - (h_mid - 0.5), 0, 1)
+                    if h_blur > 0.01:
+                        ht = _cv2.GaussianBlur(ht, (0,0), h_blur)
+                except Exception as e:
+                    print(f"[DL] AI depth failed: {e}, fallback to luminance")
+                    # Fallback to luminance path below
+                    h_src_mode = self._dl_height_src.get() if hasattr(self, '_dl_height_src') else 'Luminance'
+                    if h_src_mode == 'Red Channel': ht = arr[:,:,0]
+                    elif h_src_mode == 'Average': ht = arr.mean(axis=2)
+                    else: ht = lum.copy()
+                    if hasattr(self, '_dl_height_inv') and self._dl_height_inv.get(): ht = 1.0 - ht
+                    h_con = getv('height_contrast', 1.0)
+                    h_bri = getv('height_brightness', 0.0)
+                    h_blur = getv('height_blur', 0.0)
+                    h_mid = getv('height_midlevel', 0.5)
+                    ht = np.clip((ht - 0.5) * h_con + 0.5 + h_bri, 0, 1)
+                    ht = np.clip(ht - (h_mid - 0.5), 0, 1)
+                    if h_blur > 0.01:
+                        ht = _cv2.GaussianBlur(ht, (0,0), h_blur)
+            else:
+                h_src_mode = self._dl_height_src.get() if hasattr(self, '_dl_height_src') else 'Luminance'
+                if h_src_mode == 'Red Channel': ht = arr[:,:,0]
+                elif h_src_mode == 'Average': ht = arr.mean(axis=2)
+                else: ht = lum.copy()
+                if hasattr(self, '_dl_height_inv') and self._dl_height_inv.get(): ht = 1.0 - ht
+                h_con = getv('height_contrast', 1.0)
+                h_bri = getv('height_brightness', 0.0)
+                h_blur = getv('height_blur', 0.0)
+                h_mid = getv('height_midlevel', 0.5)
+                ht = np.clip((ht - 0.5) * h_con + 0.5 + h_bri, 0, 1)
+                ht = np.clip(ht - (h_mid - 0.5), 0, 1)
+                if h_blur > 0.01:
+                    ht = _cv2.GaussianBlur(ht, (0,0), h_blur)
             height_img = Image.fromarray((ht*255).astype(np.uint8))
             self._dl_maps['height'] = height_img
             self.root.after(0, lambda: self._dl_update_cell('height', height_img))
@@ -3587,6 +3719,24 @@ class TextureGeneratorApp:
         _sl('Blur Radius',       0.0,  8.0, 0.25, 2.5,  'blur_radius')
         _sl('Gradient Mult.',    0.05, 1.0, 0.05, 0.25, 'grad_mult')
 
+        # AI Depth for batch
+        self._pm_ai_enabled = tk.BooleanVar(value=False)
+        self._pm_ai_model_var = tk.StringVar(value='depth-anything-small')
+        self._pm_ai_detail_var = tk.DoubleVar(value=0.15)
+        ai_f = tk.Frame(sf, bg='#2a2a1a', highlightbackground='#ffcc00', highlightthickness=1)
+        ai_f.pack(fill='x', padx=16, pady=8)
+        ttk.Checkbutton(ai_f, text='USE AI DEPTH for Height (reference quality)', variable=self._pm_ai_enabled, style='Dark.TCheckbutton').pack(anchor='w', padx=8, pady=4)
+        mr = tk.Frame(ai_f, bg='#2a2a1a'); mr.pack(fill='x', padx=8, pady=2)
+        tk.Label(mr, text='Model:', bg='#2a2a1a', fg='#ffcc00', font=('Segoe UI', 8)).pack(side='left')
+        try:
+            _ai_models_pm = _ai.get_available_models() if '_AI_OK' in globals() and _AI_OK else ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        except:
+            _ai_models_pm = ['depth-anything-small', 'depth-anything-base', 'marigold-v1']
+        ttk.Combobox(mr, textvariable=self._pm_ai_model_var, values=_ai_models_pm, state='readonly', width=20).pack(side='left', padx=4)
+        dr = tk.Frame(ai_f, bg='#2a2a1a'); dr.pack(fill='x', padx=8, pady=2)
+        tk.Label(dr, text='Detail Blend: 0=smooth ref, 0.15=keep engravings', bg='#2a2a1a', fg='#e0d0a0', font=('Segoe UI', 7)).pack(anchor='w')
+        tk.Scale(dr, from_=0.0, to=0.5, resolution=0.05, orient='horizontal', variable=self._pm_ai_detail_var, bg='#2a2a1a', length=200).pack(fill='x')
+
         self._pm_norm_height = tk.BooleanVar(value=False)
         ttk.Checkbutton(sf, text='Normalize Height (stretch to full 0-255 range)',
                         variable=self._pm_norm_height,
@@ -3648,6 +3798,9 @@ class TextureGeneratorApp:
         blur_r     = self._pm_vars['blur_radius'].get()
         grad_mult  = self._pm_vars['grad_mult'].get()
         norm_h     = self._pm_norm_height.get()
+        use_ai_pm  = self._pm_ai_enabled.get() if hasattr(self, '_pm_ai_enabled') else False
+        ai_model_pm = self._pm_ai_model_var.get() if hasattr(self, '_pm_ai_model_var') else 'depth-anything-small'
+        ai_detail_pm = self._pm_ai_detail_var.get() if hasattr(self, '_pm_ai_detail_var') else 0.15
         skip_raw   = self._pm_skip_var.get()
         skip_sfx   = tuple(s.strip().lower() for s in skip_raw.split(',') if s.strip())
         fmt        = self._pm_fmt_var.get().lower()
@@ -3696,11 +3849,26 @@ class TextureGeneratorApp:
                 try:
                     img = Image.open(fpath).convert('RGB')
 
-                    # Height field
-                    gray = img.convert('L')
-                    if blur_r > 0:
-                        gray = gray.filter(_IF.GaussianBlur(radius=blur_r))
-                    height = np.array(gray).astype(np.float32) / 255.0
+                    # Height field - with AI Depth support
+                    if use_ai_pm and '_AI_OK' in globals() and _AI_OK and _ai is not None:
+                        try:
+                            depth_pil = _ai.estimate_depth_pil(img, model_type=ai_model_pm, detail_blend=ai_detail_pm)
+                            height = np.array(depth_pil).astype(np.float32) / 255.0
+                            if blur_r > 0:
+                                height_pil = Image.fromarray((height*255).astype(np.uint8))
+                                height_pil = height_pil.filter(_IF.GaussianBlur(radius=blur_r))
+                                height = np.array(height_pil).astype(np.float32) / 255.0
+                        except Exception as e:
+                            print(f"[PM] AI depth failed: {e}, fallback")
+                            gray = img.convert('L')
+                            if blur_r > 0:
+                                gray = gray.filter(_IF.GaussianBlur(radius=blur_r))
+                            height = np.array(gray).astype(np.float32) / 255.0
+                    else:
+                        gray = img.convert('L')
+                        if blur_r > 0:
+                            gray = gray.filter(_IF.GaussianBlur(radius=blur_r))
+                        height = np.array(gray).astype(np.float32) / 255.0
                     if norm_h:
                         lo_, hi_ = height.min(), height.max()
                         if hi_ - lo_ > 0:
